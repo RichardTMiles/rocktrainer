@@ -1,3 +1,0 @@
-/Users/rtm/Developer/rocktrainer/build/CMakeFiles/rocktrainer.dir
-/Users/rtm/Developer/rocktrainer/build/CMakeFiles/edit_cache.dir
-/Users/rtm/Developer/rocktrainer/build/CMakeFiles/rebuild_cache.dir
