@@ -1,0 +1,1 @@
+.\build\Release\rocktrainer.exe charts\example.json

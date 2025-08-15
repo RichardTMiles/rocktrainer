@@ -1,0 +1,18 @@
+{
+  "meta": { "title": "Public Domain Etude", "bpm": 120 },
+  "notes": [
+    { "t": 500, "str": 1, "fret": 0, "len": 250 },
+    { "t": 1000, "str": 2, "fret": 1, "len": 250 },
+    { "t": 1500, "str": 3, "fret": 2, "len": 250 },
+    { "t": 2000, "str": 4, "fret": 2, "len": 250 },
+    { "t": 2500, "str": 5, "fret": 0, "len": 250 },
+    { "t": 3000, "str": 6, "fret": 3, "len": 500 },
+
+    { "t": 4000, "str": 1, "fret": 3, "len": 250 },
+    { "t": 4500, "str": 2, "fret": 3, "len": 250 },
+    { "t": 5000, "str": 3, "fret": 4, "len": 250 },
+    { "t": 5500, "str": 4, "fret": 5, "len": 250 },
+    { "t": 6000, "str": 5, "fret": 5, "len": 250 },
+    { "t": 6500, "str": 6, "fret": 7, "len": 500 }
+  ]
+}
