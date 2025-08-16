@@ -16,6 +16,7 @@
 #include <fstream>
 #include <string_view>
 #include <filesystem>
+#include "chart.hpp"
 
 #ifdef RT_ENABLE_AUDIO
 #include <portaudio.h>
@@ -39,25 +40,12 @@ static constexpr int    kMaxFrets = 24;
 static constexpr int    kFrameHistory = 120;
 
 // --------- Globals (simple starter) ---------
-struct NoteEvent {
-  int64_t t_ms;   // start time
-  int      str;   // 1..6 (1 = high E)
-  int      fret;  // 0..24
-  int64_t len_ms; // duration
-  int      slideTo = -1;               // target fret for slide, -1 if none
-  std::vector<std::string> techs;      // technique tags
-};
-struct Chart {
-  std::vector<NoteEvent> notes;
-  double bpm = 120.0;
-  std::string title = "Example";
-};
-
 static std::atomic<float> g_detectedHz{0.0f};
 static std::atomic<int>   g_latencyOffsetMs{0};  // visual offset
 
 // Standard tuning MIDI numbers for open strings (low→high): E2 A2 D3 G3 B3 E4
-static const int kStringOpenMidi[6] = {40, 45, 50, 55, 59, 64};
+static std::array<int,6> g_stringOpenMidi{40,45,50,55,59,64};
+static std::array<std::string,6> g_stringNames{"E2","A2","D3","G3","B3","E4"};
 
 // --------- Utils ---------
 inline double hzToMidi(double hz) {
@@ -91,9 +79,9 @@ inline std::optional<DetectedNote> analyzeFrequency(double hz) {
   int bestStr = -1, bestFret = -1;
   double bestDiff = 1e9;
   for (int s = 0; s < 6; ++s) {
-    int fret = midi - kStringOpenMidi[s];
+    int fret = midi - g_stringOpenMidi[s];
     if (fret < 0 || fret > kMaxFrets) continue;
-    double diff = std::abs((double)fret - (midi - kStringOpenMidi[s]));
+    double diff = std::abs((double)fret - (midi - g_stringOpenMidi[s]));
     if (diff < bestDiff) {
       bestDiff = diff;
       bestStr = s;
@@ -102,8 +90,6 @@ inline std::optional<DetectedNote> analyzeFrequency(double hz) {
   }
   return DetectedNote{midi, cents, bestStr, bestFret};
 }
-
-static const char* kStringNames[6] = {"E2","A2","D3","G3","B3","E4"};
 
 inline void drawChar(SDL_Renderer* r, char c, int x, int y, int scale, SDL_Color col) {
   unsigned uc = static_cast<unsigned char>(c);
@@ -129,8 +115,8 @@ inline void drawText(SDL_Renderer* r, std::string_view text, int x, int y, int s
 }
 
 
-// --------- Chart loader ---------
-std::optional<Chart> loadChart(const fs::path& path) {
+// --------- Chart loaders ---------
+std::optional<Chart> loadChartJson(const fs::path& path) {
   std::ifstream f(path);
   if (!f) return std::nullopt;
   json j; f >> j;
@@ -139,6 +125,12 @@ std::optional<Chart> loadChart(const fs::path& path) {
     auto m = j["meta"];
     if (m.contains("bpm"))   c.bpm = m["bpm"].get<double>();
     if (m.contains("title")) c.title = m["title"].get<std::string>();
+    if (m.contains("tuning") && m["tuning"].is_array() && m["tuning"].size()==6) {
+      for (int i=0;i<6;++i) {
+        if (m["tuning"][i].is_number_integer())
+          c.tuning[i] = m["tuning"][i].get<int>();
+      }
+    }
   }
   if (j.contains("notes") && j["notes"].is_array()) {
     for (auto& n : j["notes"]) {
@@ -157,6 +149,13 @@ std::optional<Chart> loadChart(const fs::path& path) {
       [](const NoteEvent& a, const NoteEvent& b){return a.t_ms < b.t_ms;});
   }
   return c;
+}
+
+std::optional<Chart> loadChart(const fs::path& path) {
+  auto ext = path.extension().string();
+  if (ext == ".json") return loadChartJson(path);
+  if (ext == ".mss")  return loadChartMss(path);
+  return std::nullopt;
 }
 
 #ifdef RT_ENABLE_AUDIO
@@ -608,7 +607,7 @@ void renderTuner(App& app) {
       SDL_RenderDrawLine(app.rs.r, px, cy-60, px, cy+60);
 
       // string name
-      const char* sname = (dn.stringIdx >=0 && dn.stringIdx < 6) ? kStringNames[dn.stringIdx] : "--";
+      const char* sname = (dn.stringIdx >=0 && dn.stringIdx < 6) ? g_stringNames[dn.stringIdx].c_str() : "--";
       drawTextCentered(app.rs, sname, cy-120, 8, SDL_Color{200,200,220,255});
 
       // Hz value
@@ -666,6 +665,11 @@ int main(int argc, char** argv) {
 
   App app{};
   app.chart = loadChart(chartPath).value_or(Chart{});
+  g_stringOpenMidi = app.chart.tuning;
+  for (int i=0;i<6;++i) {
+    auto [n, oct] = midiToName(g_stringOpenMidi[i]);
+    g_stringNames[i] = n + std::to_string(oct);
+  }
 #ifdef RT_ENABLE_AUDIO
   AudioState st{};
   PaStream* stream = nullptr;
