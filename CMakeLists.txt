@@ -48,6 +48,7 @@ endif()
 # --- Target ---
 add_executable(rocktrainer
         src/main.cpp
+        src/chart_mss.cpp
 )
 
 # Includes
@@ -127,16 +128,26 @@ endif()
 
 enable_testing()
 
-add_executable(title_test tests/title_test.cpp)
+add_executable(title_test tests/title_test.cpp src/chart_mss.cpp)
 target_include_directories(title_test PRIVATE ${SDL2_INCLUDE_DIRS})
 target_link_directories(title_test PRIVATE ${SDL2_LIBRARY_DIRS})
 target_compile_options(title_test PRIVATE ${SDL2_CFLAGS_OTHER})
 target_link_options(title_test PRIVATE ${SDL2_LDFLAGS_OTHER})
 target_link_libraries(title_test PRIVATE ${SDL2_LIBRARIES})
-if (NOT nlohmann_json_FOUND)
+if (nlohmann_json_FOUND)
+    target_link_libraries(title_test PRIVATE nlohmann_json::nlohmann_json)
+else()
     target_include_directories(title_test PRIVATE ${NLOHMANN_INCLUDE_DIRS})
 endif()
 add_test(NAME TitleTest COMMAND title_test)
+
+add_executable(mss_parser_test tests/mss_parser_test.cpp src/chart_mss.cpp)
+if (nlohmann_json_FOUND)
+    target_link_libraries(mss_parser_test PRIVATE nlohmann_json::nlohmann_json)
+else()
+    target_include_directories(mss_parser_test PRIVATE ${NLOHMANN_INCLUDE_DIRS})
+endif()
+add_test(NAME MSSParserTest COMMAND mss_parser_test)
 
 add_executable(play_stats_test tests/play_stats_test.cpp)
 target_include_directories(play_stats_test PRIVATE ${SDL2_INCLUDE_DIRS})
@@ -159,3 +170,4 @@ if (NOT nlohmann_json_FOUND)
     target_include_directories(settings_test PRIVATE ${NLOHMANN_INCLUDE_DIRS})
 endif()
 add_test(NAME SettingsTest COMMAND settings_test)
+
