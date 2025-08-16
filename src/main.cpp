@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <utility>
 #include <optional>
 #include <chrono>
 #include <thread>
@@ -43,7 +44,6 @@ struct Chart {
 };
 
 static std::atomic<float> g_detectedHz{0.0f};
-static std::atomic<bool>  g_running{true};
 static std::atomic<int>   g_latencyOffsetMs{0};  // visual offset
 
 // Standard tuning MIDI numbers for open strings (low→high): E2 A2 D3 G3 B3 E4
@@ -180,6 +180,19 @@ struct RenderState {
   int w = 1280, h = 720;
 };
 
+// --------- App State Machine ---------
+enum class AppState { Title, Library, Tuner, FreePlay, Settings, Play };
+
+struct App {
+  RenderState rs;
+  Chart chart;
+  AppState state = AppState::Title;
+  int menuIndex = 0; // index into title menu
+  bool running = true;
+  bool playing = true; // used in Play state
+  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+};
+
 bool initSDL(RenderState& rs) {
   if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_EVENTS|SDL_INIT_TIMER) != 0) {
     std::cerr << "SDL_Init: " << SDL_GetError() << "\n"; return false;
@@ -193,7 +206,8 @@ bool initSDL(RenderState& rs) {
   return true;
 }
 
-void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
+// Render the play state (chart + tuner overlay)
+void renderPlayScreen(RenderState& rs, const Chart* chart, int64_t now_ms) {
   // Clear bg
   SDL_SetRenderDrawColor(rs.r, 12,12,16,255);
   SDL_RenderClear(rs.r);
@@ -256,10 +270,108 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
   SDL_RenderPresent(rs.r);
 }
 
+// --------- Render helpers for other states ---------
+static const std::vector<std::pair<const char*, AppState>> kMenu = {
+  {"Library", AppState::Library},
+  {"Tuner", AppState::Tuner},
+  {"Free Play", AppState::FreePlay},
+  {"Settings", AppState::Settings},
+  {"Play", AppState::Play},
+};
+
+void renderTitle(App& app) {
+  SDL_SetRenderDrawColor(app.rs.r, 0, 0, 40, 255);
+  SDL_RenderClear(app.rs.r);
+  int itemH = 60;
+  int startY = app.rs.h/2 - (int)kMenu.size()*itemH/2;
+  for (size_t i = 0; i < kMenu.size(); ++i) {
+    int y = startY + (int)i*itemH;
+    SDL_Rect rect{ app.rs.w/3, y, app.rs.w/3, itemH-10 };
+    SDL_SetRenderDrawColor(app.rs.r, 80,80,80,255);
+    SDL_RenderFillRect(app.rs.r, &rect);
+    if ((int)i == app.menuIndex) {
+      SDL_SetRenderDrawColor(app.rs.r, 0,255,200,100);
+      SDL_Rect bar{ rect.x-10, y-5, rect.w+20, itemH };
+      SDL_RenderFillRect(app.rs.r, &bar);
+    }
+  }
+  SDL_RenderPresent(app.rs.r);
+}
+
+void updateTitle(App& app, const SDL_Event& e) {
+  if (e.type != SDL_KEYDOWN) return;
+  if (e.key.keysym.sym == SDLK_UP) {
+    app.menuIndex = (app.menuIndex + (int)kMenu.size() - 1) % (int)kMenu.size();
+  } else if (e.key.keysym.sym == SDLK_DOWN) {
+    app.menuIndex = (app.menuIndex + 1) % (int)kMenu.size();
+  } else if (e.key.keysym.sym == SDLK_RETURN) {
+    app.state = kMenu[app.menuIndex].second;
+    app.t0 = std::chrono::steady_clock::now();
+  } else if (e.key.keysym.sym == SDLK_ESCAPE) {
+    app.running = false;
+  }
+}
+
+void renderStub(App& app) {
+  SDL_SetRenderDrawColor(app.rs.r, 20,20,25,255);
+  SDL_RenderClear(app.rs.r);
+  SDL_RenderPresent(app.rs.r);
+}
+
+void updateReturnToTitle(App& app, const SDL_Event& e) {
+  if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)
+    app.state = AppState::Title;
+}
+
+void renderLibrary(App& app){ renderStub(app); }
+void updateLibrary(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
+
+void renderFreePlay(App& app){ renderStub(app); }
+void updateFreePlay(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
+
+void renderSettings(App& app){ renderStub(app); }
+void updateSettings(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
+
+void renderTuner(App& app) {
+  SDL_SetRenderDrawColor(app.rs.r, 12,12,16,255);
+  SDL_RenderClear(app.rs.r);
+  float hz = g_detectedHz.load(std::memory_order_relaxed);
+  if (hz > 0.0f) {
+    auto dn = analyzeFrequency(hz);
+    if (dn) {
+      int bar = std::clamp((int)((hz/1000.0)*app.rs.w), 0, app.rs.w);
+      SDL_SetRenderDrawColor(app.rs.r, 200,200,220,255);
+      SDL_Rect rect{20,20,bar,8};
+      SDL_RenderFillRect(app.rs.r, &rect);
+      int cx = app.rs.w/2 + (int)(dn->cents * 2);
+      SDL_SetRenderDrawColor(app.rs.r, 255,120,120,255);
+      SDL_RenderDrawLine(app.rs.r, cx, 40, cx, 80);
+      SDL_SetRenderDrawColor(app.rs.r, 150,150,150,255);
+      SDL_RenderDrawLine(app.rs.r, app.rs.w/2, 40, app.rs.w/2, 80);
+    }
+  }
+  SDL_RenderPresent(app.rs.r);
+}
+
+void updateTuner(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
+
+void renderPlay(App& app, int64_t now_ms){
+  renderPlayScreen(app.rs, app.chart.notes.empty()?nullptr:&app.chart, now_ms);
+}
+
+void updatePlay(App& app, const SDL_Event& e){
+  if (e.type != SDL_KEYDOWN) return;
+  if (e.key.keysym.sym == SDLK_ESCAPE) app.state = AppState::Title;
+  if (e.key.keysym.sym == SDLK_SPACE) app.playing = !app.playing;
+  if (e.key.keysym.sym == SDLK_EQUALS || e.key.keysym.sym == SDLK_PLUS) g_latencyOffsetMs.fetch_add(5);
+  if (e.key.keysym.sym == SDLK_MINUS) g_latencyOffsetMs.fetch_add(-5);
+}
+
 // --------- Main ---------
 int main(int argc, char** argv) {
   std::string chartPath = (argc > 1) ? argv[1] : "charts/example.json";
-  auto chart = loadChart(chartPath).value_or(Chart{});
+  App app{};
+  app.chart = loadChart(chartPath).value_or(Chart{});
 
   // Init PortAudio
   Pa_Initialize();
@@ -291,29 +403,41 @@ int main(int argc, char** argv) {
   Pa_StartStream(stream);
 
   // Init SDL
-  RenderState rs{};
-  if (!initSDL(rs)) { std::cerr << "SDL init failed\n"; return 1; }
+  if (!initSDL(app.rs)) { std::cerr << "SDL init failed\n"; return 1; }
 
   // Main loop
-  auto t0 = std::chrono::steady_clock::now();
-  bool playing = true;
-  while (g_running.load()) {
+  while (app.running) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-      if (e.type == SDL_QUIT) g_running.store(false);
-      if (e.type == SDL_KEYDOWN) {
-        if (e.key.keysym.sym == SDLK_ESCAPE) g_running.store(false);
-        if (e.key.keysym.sym == SDLK_SPACE) playing = !playing;
-        if (e.key.keysym.sym == SDLK_EQUALS || e.key.keysym.sym == SDLK_PLUS) g_latencyOffsetMs.fetch_add(5);
-        if (e.key.keysym.sym == SDLK_MINUS) g_latencyOffsetMs.fetch_add(-5);
+      if (e.type == SDL_QUIT) app.running = false;
+      else {
+        switch (app.state) {
+          case AppState::Title:   updateTitle(app, e); break;
+          case AppState::Library: updateLibrary(app, e); break;
+          case AppState::Tuner:   updateTuner(app, e); break;
+          case AppState::FreePlay:updateFreePlay(app, e); break;
+          case AppState::Settings:updateSettings(app, e); break;
+          case AppState::Play:    updatePlay(app, e); break;
+        }
       }
     }
-    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - t0).count();
-    if (!playing) { t0 = std::chrono::steady_clock::now(); } // pause resets time baseline
 
-    now_ms += g_latencyOffsetMs.load();
-    drawChart(rs, chart.notes.empty() ? nullptr : &chart, now_ms);
+    int64_t now_ms = 0;
+    if (app.state == AppState::Play) {
+      now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - app.t0).count();
+      if (!app.playing) { app.t0 = std::chrono::steady_clock::now(); }
+      now_ms += g_latencyOffsetMs.load();
+    }
+
+    switch (app.state) {
+      case AppState::Title:   renderTitle(app); break;
+      case AppState::Library: renderLibrary(app); break;
+      case AppState::Tuner:   renderTuner(app); break;
+      case AppState::FreePlay:renderFreePlay(app); break;
+      case AppState::Settings:renderSettings(app); break;
+      case AppState::Play:    renderPlay(app, now_ms); break;
+    }
 
     SDL_Delay(16); // ~60fps
   }
@@ -324,8 +448,8 @@ int main(int argc, char** argv) {
   del_fvec(st.inputFrame);
   Pa_Terminate();
 
-  if (rs.r) SDL_DestroyRenderer(rs.r);
-  if (rs.window) SDL_DestroyWindow(rs.window);
+  if (app.rs.r) SDL_DestroyRenderer(app.rs.r);
+  if (app.rs.window) SDL_DestroyWindow(app.rs.window);
   SDL_Quit();
 
   return 0;
