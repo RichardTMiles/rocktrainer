@@ -418,16 +418,35 @@ void renderTitle(App& app) {
 }
 
 void updateTitle(App& app, const SDL_Event& e) {
-  if (e.type != SDL_KEYDOWN) return;
-  if (e.key.keysym.sym == SDLK_UP) {
-    app.menuIndex = (app.menuIndex + (int)kMenu.size() - 1) % (int)kMenu.size();
-  } else if (e.key.keysym.sym == SDLK_DOWN) {
-    app.menuIndex = (app.menuIndex + 1) % (int)kMenu.size();
-  } else if (e.key.keysym.sym == SDLK_RETURN) {
-    app.state = kMenu[app.menuIndex].second;
-    app.t0 = std::chrono::steady_clock::now();
-  } else if (e.key.keysym.sym == SDLK_ESCAPE) {
-    app.running = false;
+  int itemH = 60;
+  int startY = app.rs.h/2 - (int)kMenu.size()*itemH/2;
+  if (e.type == SDL_KEYDOWN) {
+    if (e.key.keysym.sym == SDLK_UP) {
+      app.menuIndex = (app.menuIndex + (int)kMenu.size() - 1) % (int)kMenu.size();
+    } else if (e.key.keysym.sym == SDLK_DOWN) {
+      app.menuIndex = (app.menuIndex + 1) % (int)kMenu.size();
+    } else if (e.key.keysym.sym == SDLK_RETURN) {
+      app.state = kMenu[app.menuIndex].second;
+      app.t0 = std::chrono::steady_clock::now();
+    } else if (e.key.keysym.sym == SDLK_ESCAPE) {
+      app.running = false;
+    }
+  } else if (e.type == SDL_MOUSEMOTION) {
+    int mx = e.motion.x;
+    int my = e.motion.y;
+    if (mx >= app.rs.w/3 && mx < 2*app.rs.w/3 &&
+        my >= startY && my < startY + (int)kMenu.size()*itemH) {
+      app.menuIndex = (my - startY) / itemH;
+    }
+  } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+    int mx = e.button.x;
+    int my = e.button.y;
+    if (mx >= app.rs.w/3 && mx < 2*app.rs.w/3 &&
+        my >= startY && my < startY + (int)kMenu.size()*itemH) {
+      app.menuIndex = (my - startY) / itemH;
+      app.state = kMenu[app.menuIndex].second;
+      app.t0 = std::chrono::steady_clock::now();
+    }
   }
 }
 
@@ -506,6 +525,7 @@ void updatePlay(App& app, const SDL_Event& e){
 }
 
 // --------- Main ---------
+#ifndef ROCKTRAINER_NO_MAIN
 int main(int argc, char** argv) {
   std::string chartPath = (argc > 1) ? argv[1] : "charts/example.json";
   App app{};
@@ -599,3 +619,4 @@ int main(int argc, char** argv) {
 
   return 0;
 }
+#endif // ROCKTRAINER_NO_MAIN
