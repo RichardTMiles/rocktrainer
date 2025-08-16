@@ -13,12 +13,14 @@
 #include <algorithm>
 #include <iostream>
 #include <fstream>
+#include <string_view>
 
 #ifdef RT_ENABLE_AUDIO
 #include <portaudio.h>
 #include <aubio/aubio.h>
 #endif
 #include <SDL.h>
+#include "font8x8_basic.h"
 
 // nlohmann json (header-only). Install via package manager.
 // If CMake can't find it automatically, ensure its include dir is visible.
@@ -96,6 +98,32 @@ inline std::optional<DetectedNote> analyzeFrequency(double hz) {
   }
   return DetectedNote{midi, cents, bestStr, bestFret};
 }
+
+static const char* kStringNames[6] = {"E2","A2","D3","G3","B3","E4"};
+
+inline void drawChar(SDL_Renderer* r, char c, int x, int y, int scale, SDL_Color col) {
+  unsigned uc = static_cast<unsigned char>(c);
+  if (uc >= 128) return;
+  const uint8_t* bmp = font8x8_basic[uc];
+  SDL_SetRenderDrawColor(r, col.r, col.g, col.b, col.a);
+  for (int row = 0; row < 8; ++row) {
+    for (int bit = 0; bit < 8; ++bit) {
+      if ((bmp[row] >> bit) & 1) {
+        SDL_Rect px{ x + bit*scale, y + row*scale, scale, scale };
+        SDL_RenderFillRect(r, &px);
+      }
+    }
+  }
+}
+
+inline void drawText(SDL_Renderer* r, std::string_view text, int x, int y, int scale, SDL_Color col) {
+  int cx = x;
+  for (char c : text) {
+    if (c != ' ') drawChar(r, c, cx, y, scale, col);
+    cx += 8 * scale;
+  }
+}
+
 
 // --------- Chart loader ---------
 std::optional<Chart> loadChart(const std::string& path) {
@@ -189,6 +217,12 @@ struct RenderState {
   SDL_Renderer* r = nullptr;
   int w = 1280, h = 720;
 };
+
+inline void drawTextCentered(RenderState& rs, std::string_view text, int y, int scale, SDL_Color col) {
+  int w = (int)text.size() * 8 * scale;
+  int x = rs.w / 2 - w / 2;
+  drawText(rs.r, text, x, y, scale, col);
+}
 
 // --------- App State Machine ---------
 enum class AppState { Title, Library, Tuner, FreePlay, Settings, Play };
@@ -385,19 +419,38 @@ void updateSettings(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
 void renderTuner(App& app) {
   SDL_SetRenderDrawColor(app.rs.r, 12,12,16,255);
   SDL_RenderClear(app.rs.r);
+
   float hz = g_detectedHz.load(std::memory_order_relaxed);
   if (hz > 0.0f) {
-    auto dn = analyzeFrequency(hz);
-    if (dn) {
-      int bar = std::clamp((int)((hz/1000.0)*app.rs.w), 0, app.rs.w);
-      SDL_SetRenderDrawColor(app.rs.r, 200,200,220,255);
-      SDL_Rect rect{20,20,bar,8};
-      SDL_RenderFillRect(app.rs.r, &rect);
-      int cx = app.rs.w/2 + (int)(dn->cents * 2);
+    auto dnOpt = analyzeFrequency(hz);
+    if (dnOpt) {
+      auto& dn = *dnOpt;
+      int cx = app.rs.w/2;
+      int cy = app.rs.h/2;
+      int meterW = app.rs.w * 3 / 4;
+      int left = cx - meterW/2;
+      int right = cx + meterW/2;
+
+      // baseline
+      SDL_SetRenderDrawColor(app.rs.r, 60,60,70,255);
+      SDL_RenderDrawLine(app.rs.r, left, cy, right, cy);
+      // center tick
+      SDL_RenderDrawLine(app.rs.r, cx, cy-40, cx, cy+40);
+
+      // pointer for cents (-50..+50)
+      double cents = std::clamp(dn.cents, -50.0, 50.0);
+      int px = cx + int(cents/50.0 * (meterW/2));
       SDL_SetRenderDrawColor(app.rs.r, 255,120,120,255);
-      SDL_RenderDrawLine(app.rs.r, cx, 40, cx, 80);
-      SDL_SetRenderDrawColor(app.rs.r, 150,150,150,255);
-      SDL_RenderDrawLine(app.rs.r, app.rs.w/2, 40, app.rs.w/2, 80);
+      SDL_RenderDrawLine(app.rs.r, px, cy-60, px, cy+60);
+
+      // string name
+      const char* sname = (dn.stringIdx >=0 && dn.stringIdx < 6) ? kStringNames[dn.stringIdx] : "--";
+      drawTextCentered(app.rs, sname, cy-120, 8, SDL_Color{200,200,220,255});
+
+      // Hz value
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%.1f Hz", hz);
+      drawTextCentered(app.rs, buf, cy+80, 4, SDL_Color{200,200,220,255});
     }
   }
   SDL_RenderPresent(app.rs.r);
