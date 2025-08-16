@@ -14,6 +14,7 @@
 #include <iostream>
 #include <fstream>
 #include <string_view>
+#include <filesystem>
 
 #ifdef RT_ENABLE_AUDIO
 #include <portaudio.h>
@@ -26,6 +27,7 @@
 // If CMake can't find it automatically, ensure its include dir is visible.
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 // --------- Config ---------
 static constexpr double kSampleRate = 48000.0;
@@ -126,7 +128,7 @@ inline void drawText(SDL_Renderer* r, std::string_view text, int x, int y, int s
 
 
 // --------- Chart loader ---------
-std::optional<Chart> loadChart(const std::string& path) {
+std::optional<Chart> loadChart(const fs::path& path) {
   std::ifstream f(path);
   if (!f) return std::nullopt;
   json j; f >> j;
@@ -530,7 +532,32 @@ void updatePlay(App& app, const SDL_Event& e){
 // --------- Main ---------
 #ifndef ROCKTRAINER_NO_MAIN
 int main(int argc, char** argv) {
-  std::string chartPath = (argc > 1) ? argv[1] : "charts/example.json";
+  fs::path exeDir;
+  try {
+    exeDir = fs::canonical(fs::path(argv[0])).parent_path();
+  } catch (const fs::filesystem_error&) {
+    exeDir = fs::current_path();
+  }
+  fs::path dataRoot = exeDir;
+  if (!fs::exists(dataRoot / "charts")) {
+    dataRoot = exeDir.parent_path();
+  }
+
+  fs::path chartPath = (argc > 1) ? fs::path(argv[1]) : fs::path("charts") / "example.json";
+  if (!chartPath.is_absolute()) {
+    chartPath = dataRoot / chartPath;
+  }
+  if (!fs::exists(chartPath)) {
+    std::cerr << "Chart file not found: " << chartPath << "\n";
+    return 1;
+  }
+
+  fs::path assetsDir = dataRoot / "assets";
+  if (!fs::exists(assetsDir)) {
+    std::cerr << "Assets directory not found: " << assetsDir << "\n";
+    return 1;
+  }
+
   App app{};
   app.chart = loadChart(chartPath).value_or(Chart{});
 #ifdef RT_ENABLE_AUDIO
