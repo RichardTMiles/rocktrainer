@@ -26,6 +26,32 @@ int main() {
     updateTitle(app, e);
     assert(app.state == AppState::FreePlay);
 
+    // Rendering should draw menu text
+    SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+    SDL_Init(SDL_INIT_VIDEO);
+    SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(0, app.rs.w, app.rs.h, 32, SDL_PIXELFORMAT_RGBA8888);
+    app.rs.r = SDL_CreateSoftwareRenderer(surface);
+
+    renderTitle(app);
+
+    Uint32 bg = SDL_MapRGBA(surface->format, 80, 80, 80, 255);
+    bool found = false;
+    int scale = 4;
+    int y = startY + itemH; // second item (unselected)
+    int textY = y + (itemH - 8*scale)/2;
+    int pitch = surface->pitch / 4;
+    Uint32* pixels = static_cast<Uint32*>(surface->pixels);
+    for (int py = textY; py < textY + 8*scale && !found; ++py) {
+        for (int px = app.rs.w/3; px < 2*app.rs.w/3 && !found; ++px) {
+            if (pixels[py*pitch + px] != bg) found = true;
+        }
+    }
+    assert(found);
+
+    SDL_DestroyRenderer(app.rs.r);
+    SDL_FreeSurface(surface);
+    SDL_Quit();
+
     return 0;
 }
 

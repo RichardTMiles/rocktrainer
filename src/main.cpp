@@ -413,6 +413,9 @@ void renderTitle(App& app) {
       SDL_Rect bar{ rect.x-10, y-5, rect.w+20, itemH };
       SDL_RenderFillRect(app.rs.r, &bar);
     }
+    int scale = 4;
+    int textY = y + (itemH - 8*scale) / 2;
+    drawTextCentered(app.rs, kMenu[i].first, textY, scale, SDL_Color{20,20,20,255});
   }
   SDL_RenderPresent(app.rs.r);
 }
