@@ -59,6 +59,80 @@ static std::atomic<int>   g_latencyOffsetMs{0};  // visual offset
 // Standard tuning MIDI numbers for open strings (low→high): E2 A2 D3 G3 B3 E4
 static const int kStringOpenMidi[6] = {40, 45, 50, 55, 59, 64};
 
+struct AudioDevice {
+  int index = -1;
+  std::string name;
+};
+
+struct SettingsState {
+  std::vector<AudioDevice> audioDevices;
+  int audioDeviceIndex = -1;
+  int bufferSize = kHopSize;
+  int latencyOffset = 0;
+  bool vsync = true;
+  int width = 1280;
+  int height = 720;
+  std::array<SDL_Color,6> stringColors{
+    SDL_Color{128,0,255,255}, {0,0,255,255}, {0,255,0,255},
+    {255,255,0,255}, {255,128,0,255}, {255,0,0,255}
+  };
+};
+
+static std::string colorToHex(const SDL_Color& c) {
+  char buf[8];
+  std::snprintf(buf, sizeof(buf), "#%02X%02X%02X", c.r, c.g, c.b);
+  return buf;
+}
+
+static SDL_Color hexToColor(const std::string& s) {
+  SDL_Color c{0,0,0,255};
+  if (s.size() >= 7) {
+    int r,g,b;
+    if (std::sscanf(s.c_str()+1, "%02x%02x%02x", &r, &g, &b) == 3) {
+      c.r = static_cast<Uint8>(r);
+      c.g = static_cast<Uint8>(g);
+      c.b = static_cast<Uint8>(b);
+    }
+  }
+  return c;
+}
+
+static bool loadConfig(const std::string& path, SettingsState& st) {
+  std::ifstream f(path);
+  if (!f.good()) return false;
+  json j; f >> j;
+  st.audioDeviceIndex = j.value("audio_device", st.audioDeviceIndex);
+  st.bufferSize = j.value("buffer_size", st.bufferSize);
+  st.latencyOffset = j.value("latency_offset", st.latencyOffset);
+  st.vsync = j.value("vsync", st.vsync);
+  st.width = j.value("width", st.width);
+  st.height = j.value("height", st.height);
+  if (j.contains("string_colors") && j["string_colors"].is_array()) {
+    size_t i = 0;
+    for (auto& jc : j["string_colors"]) {
+      if (i < st.stringColors.size()) st.stringColors[i++] = hexToColor(jc.get<std::string>());
+    }
+  }
+  return true;
+}
+
+static bool saveConfig(const std::string& path, const SettingsState& st) {
+  json j;
+  j["audio_device"] = st.audioDeviceIndex;
+  j["buffer_size"] = st.bufferSize;
+  j["latency_offset"] = st.latencyOffset;
+  j["vsync"] = st.vsync;
+  j["width"] = st.width;
+  j["height"] = st.height;
+  std::vector<std::string> cols;
+  for (const auto& c : st.stringColors) cols.push_back(colorToHex(c));
+  j["string_colors"] = cols;
+  std::ofstream f(path);
+  if (!f.good()) return false;
+  f << j.dump(2);
+  return true;
+}
+
 // --------- Utils ---------
 inline double hzToMidi(double hz) {
   return 69.0 + 12.0 * std::log2(hz / 440.0);
@@ -189,29 +263,15 @@ static int audioCb(const void* input, void*, unsigned long frameCount,
   return paContinue;
 }
 
-struct DevicePick {
-  int index = -1;
-  std::string name;
-};
-
-DevicePick pickInputDevice() {
-  DevicePick pick{};
+std::vector<AudioDevice> listAudioDevices() {
+  std::vector<AudioDevice> devs;
   int num = Pa_GetDeviceCount();
   for (int i = 0; i < num; ++i) {
     const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
     if (!info || info->maxInputChannels < 1) continue;
-    std::string name = info->name ? info->name : "";
-    // loosen matching if needed
-    if (name.find("Rocksmith") != std::string::npos ||
-        name.find("Real Tone") != std::string::npos) {
-      pick.index = i; pick.name = name; return pick;
-    }
+    devs.push_back(AudioDevice{i, info->name ? info->name : ""});
   }
-  // fallback default
-  int def = Pa_GetDefaultInputDevice();
-  const PaDeviceInfo* info = Pa_GetDeviceInfo(def);
-  if (info) { pick.index = def; pick.name = info->name; }
-  return pick;
+  return devs;
 }
 #endif
 
@@ -237,6 +297,7 @@ enum class AppState { Title, Library, Tuner, FreePlay, Settings, Play };
 struct App {
   RenderState rs;
   Chart chart;
+  SettingsState settings;
   AppState state = AppState::Title;
   int menuIndex = 0; // index into title menu
   bool running = true;
@@ -248,7 +309,7 @@ struct App {
   bool showFrameGraph = false;
 };
 
-bool initSDL(RenderState& rs) {
+bool initSDL(RenderState& rs, const SettingsState& settings) {
   SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
   if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_EVENTS|SDL_INIT_TIMER) != 0) {
     std::cerr << "SDL_Init: " << SDL_GetError() << "\n"; return false;
@@ -257,7 +318,9 @@ bool initSDL(RenderState& rs) {
                                SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                rs.w, rs.h, SDL_WINDOW_SHOWN);
   if (!rs.window) { std::cerr << "SDL_CreateWindow failed\n"; return false; }
-  rs.r = SDL_CreateRenderer(rs.window, -1, SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
+  Uint32 flags = SDL_RENDERER_ACCELERATED;
+  if (settings.vsync) flags |= SDL_RENDERER_PRESENTVSYNC;
+  rs.r = SDL_CreateRenderer(rs.window, -1, flags);
   if (!rs.r) { std::cerr << "SDL_CreateRenderer failed\n"; return false; }
   // Create render targets
   rs.laneTex = SDL_CreateTexture(rs.r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, rs.w, rs.h);
@@ -302,7 +365,8 @@ void renderFrameGraph(App& app) {
 }
 
 // Render the play state (chart + tuner overlay)
-void drawChart(App& app, const Chart* chart, int64_t now_ms) {
+void drawChart(RenderState& rs, const Chart* chart, const SettingsState& settings, int64_t now_ms) {
+
   RenderState& rs = app.rs;
   // First pass: render chart to offscreen texture
   SDL_SetRenderTarget(rs.r, rs.laneTex);
@@ -312,13 +376,9 @@ void drawChart(App& app, const Chart* chart, int64_t now_ms) {
   // Colored lanes (low E bottom → purple, high E top → red)
   int laneH = rs.h / 8;
   int topOffset = laneH; // top margin
-  static const SDL_Color kStrColors[6] = {
-    {128,0,255,255}, {0,0,255,255}, {0,255,0,255},
-    {255,255,0,255}, {255,128,0,255}, {255,0,0,255}
-  };
   for (int s = 0; s < 6; ++s) {
     int y = rs.h - topOffset - s*laneH;
-    SDL_Color c = kStrColors[s];
+    SDL_Color c = settings.stringColors[s];
     SDL_SetRenderDrawColor(rs.r, c.r/4, c.g/4, c.b/4, 255);
     SDL_Rect lane{ 0, y - laneH/2, rs.w, laneH-2 };
     SDL_RenderFillRect(rs.r, &lane);
@@ -357,7 +417,7 @@ void drawChart(App& app, const Chart* chart, int64_t now_ms) {
       int headW = std::max(12, (int)(12 * scale));
       int sustainW = w - headW;
 
-      SDL_Color c = kStrColors[sIdx];
+      SDL_Color c = settings.stringColors[sIdx];
       SDL_SetRenderDrawColor(rs.r, c.r, c.g, c.b, alpha);
       SDL_Rect head{ (int)x - headW/2, y - h/2, headW, h };
       SDL_RenderFillRect(rs.r, &head);
@@ -624,7 +684,7 @@ void renderTuner(App& app) {
 void updateTuner(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
 
 void renderPlay(App& app, int64_t now_ms){
-  drawChart(app, app.chart.notes.empty()?nullptr:&app.chart, now_ms);
+  drawChart(app.rs, app.chart.notes.empty()?nullptr:&app.chart, app.settings, now_ms);
 }
 
 void updatePlay(App& app, const SDL_Event& e){
@@ -665,29 +725,33 @@ int main(int argc, char** argv) {
   }
 
   App app{};
+  loadConfig("config.json", app.settings);
+  g_latencyOffsetMs.store(app.settings.latencyOffset);
   app.chart = loadChart(chartPath).value_or(Chart{});
 #ifdef RT_ENABLE_AUDIO
   AudioState st{};
   PaStream* stream = nullptr;
 
-  // Init PortAudio
   Pa_Initialize();
-  auto pick = pickInputDevice();
-  if (pick.index < 0) {
+  app.settings.audioDevices = listAudioDevices();
+  int dev = app.settings.audioDeviceIndex;
+  if (dev < 0) dev = Pa_GetDefaultInputDevice();
+  const PaDeviceInfo* info = Pa_GetDeviceInfo(dev);
+  if (!info) {
     std::cerr << "No input device found.\n";
     return 1;
   }
-  std::cout << "Using input: " << pick.name << "\n";
+  app.settings.audioDeviceIndex = dev;
+  std::cout << "Using input: " << info->name << "\n";
 
   PaStreamParameters in{};
-  in.device = pick.index;
-  const PaDeviceInfo* info = Pa_GetDeviceInfo(in.device);
+  in.device = dev;
   in.channelCount = 1;
   in.sampleFormat = paFloat32;
   in.suggestedLatency = info ? info->defaultLowInputLatency : 0.0;
   in.hostApiSpecificStreamInfo = nullptr;
 
-  st.hop = kHopSize;
+  st.hop = app.settings.bufferSize;
   st.inputFrame = new_fvec(st.hop);
   st.pitch = new_aubio_pitch("yinfast", kWinSize, st.hop, (unsigned)kSampleRate);
   aubio_pitch_set_unit(st.pitch, "Hz");
@@ -696,10 +760,14 @@ int main(int argc, char** argv) {
   PaError err = Pa_OpenStream(&stream, &in, nullptr, kSampleRate, st.hop, paNoFlag, audioCb, &st);
   if (err != paNoError) { std::cerr << "Pa_OpenStream: " << Pa_GetErrorText(err) << "\n"; return 1; }
   Pa_StartStream(stream);
+#else
+  app.settings.audioDevices.clear();
 #endif
 
+  app.rs.w = app.settings.width;
+  app.rs.h = app.settings.height;
   // Init SDL
-  if (!initSDL(app.rs)) { std::cerr << "SDL init failed\n"; return 1; }
+  if (!initSDL(app.rs, app.settings)) { std::cerr << "SDL init failed\n"; return 1; }
 
   const double freq = (double)SDL_GetPerformanceFrequency();
   Uint64 lastCounter = SDL_GetPerformanceCounter();
@@ -764,6 +832,9 @@ int main(int argc, char** argv) {
   if (app.rs.r) SDL_DestroyRenderer(app.rs.r);
   if (app.rs.window) SDL_DestroyWindow(app.rs.window);
   SDL_Quit();
+
+  app.settings.latencyOffset = g_latencyOffsetMs.load();
+  saveConfig("config.json", app.settings);
 
   return 0;
 }
