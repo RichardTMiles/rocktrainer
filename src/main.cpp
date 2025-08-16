@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <array>
 #include <utility>
 #include <optional>
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <fstream>
 #include <string_view>
+#include <filesystem>
 
 #ifdef RT_ENABLE_AUDIO
 #include <portaudio.h>
@@ -26,6 +28,7 @@
 // If CMake can't find it automatically, ensure its include dir is visible.
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 // --------- Config ---------
 static constexpr double kSampleRate = 48000.0;
@@ -33,6 +36,7 @@ static constexpr unsigned kHopSize = 512;   // buffer size per callback
 static constexpr unsigned kWinSize = 2048;  // analysis window
 static constexpr float  kSilenceDb = -50.0f;
 static constexpr int    kMaxFrets = 24;
+static constexpr int    kFrameHistory = 120;
 
 // --------- Globals (simple starter) ---------
 struct NoteEvent {
@@ -54,6 +58,80 @@ static std::atomic<int>   g_latencyOffsetMs{0};  // visual offset
 
 // Standard tuning MIDI numbers for open strings (low→high): E2 A2 D3 G3 B3 E4
 static const int kStringOpenMidi[6] = {40, 45, 50, 55, 59, 64};
+
+struct AudioDevice {
+  int index = -1;
+  std::string name;
+};
+
+struct SettingsState {
+  std::vector<AudioDevice> audioDevices;
+  int audioDeviceIndex = -1;
+  int bufferSize = kHopSize;
+  int latencyOffset = 0;
+  bool vsync = true;
+  int width = 1280;
+  int height = 720;
+  std::array<SDL_Color,6> stringColors{
+    SDL_Color{128,0,255,255}, {0,0,255,255}, {0,255,0,255},
+    {255,255,0,255}, {255,128,0,255}, {255,0,0,255}
+  };
+};
+
+static std::string colorToHex(const SDL_Color& c) {
+  char buf[8];
+  std::snprintf(buf, sizeof(buf), "#%02X%02X%02X", c.r, c.g, c.b);
+  return buf;
+}
+
+static SDL_Color hexToColor(const std::string& s) {
+  SDL_Color c{0,0,0,255};
+  if (s.size() >= 7) {
+    int r,g,b;
+    if (std::sscanf(s.c_str()+1, "%02x%02x%02x", &r, &g, &b) == 3) {
+      c.r = static_cast<Uint8>(r);
+      c.g = static_cast<Uint8>(g);
+      c.b = static_cast<Uint8>(b);
+    }
+  }
+  return c;
+}
+
+static bool loadConfig(const std::string& path, SettingsState& st) {
+  std::ifstream f(path);
+  if (!f.good()) return false;
+  json j; f >> j;
+  st.audioDeviceIndex = j.value("audio_device", st.audioDeviceIndex);
+  st.bufferSize = j.value("buffer_size", st.bufferSize);
+  st.latencyOffset = j.value("latency_offset", st.latencyOffset);
+  st.vsync = j.value("vsync", st.vsync);
+  st.width = j.value("width", st.width);
+  st.height = j.value("height", st.height);
+  if (j.contains("string_colors") && j["string_colors"].is_array()) {
+    size_t i = 0;
+    for (auto& jc : j["string_colors"]) {
+      if (i < st.stringColors.size()) st.stringColors[i++] = hexToColor(jc.get<std::string>());
+    }
+  }
+  return true;
+}
+
+static bool saveConfig(const std::string& path, const SettingsState& st) {
+  json j;
+  j["audio_device"] = st.audioDeviceIndex;
+  j["buffer_size"] = st.bufferSize;
+  j["latency_offset"] = st.latencyOffset;
+  j["vsync"] = st.vsync;
+  j["width"] = st.width;
+  j["height"] = st.height;
+  std::vector<std::string> cols;
+  for (const auto& c : st.stringColors) cols.push_back(colorToHex(c));
+  j["string_colors"] = cols;
+  std::ofstream f(path);
+  if (!f.good()) return false;
+  f << j.dump(2);
+  return true;
+}
 
 // --------- Utils ---------
 inline double hzToMidi(double hz) {
@@ -126,7 +204,7 @@ inline void drawText(SDL_Renderer* r, std::string_view text, int x, int y, int s
 
 
 // --------- Chart loader ---------
-std::optional<Chart> loadChart(const std::string& path) {
+std::optional<Chart> loadChart(const fs::path& path) {
   std::ifstream f(path);
   if (!f) return std::nullopt;
   json j; f >> j;
@@ -185,29 +263,15 @@ static int audioCb(const void* input, void*, unsigned long frameCount,
   return paContinue;
 }
 
-struct DevicePick {
-  int index = -1;
-  std::string name;
-};
-
-DevicePick pickInputDevice() {
-  DevicePick pick{};
+std::vector<AudioDevice> listAudioDevices() {
+  std::vector<AudioDevice> devs;
   int num = Pa_GetDeviceCount();
   for (int i = 0; i < num; ++i) {
     const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
     if (!info || info->maxInputChannels < 1) continue;
-    std::string name = info->name ? info->name : "";
-    // loosen matching if needed
-    if (name.find("Rocksmith") != std::string::npos ||
-        name.find("Real Tone") != std::string::npos) {
-      pick.index = i; pick.name = name; return pick;
-    }
+    devs.push_back(AudioDevice{i, info->name ? info->name : ""});
   }
-  // fallback default
-  int def = Pa_GetDefaultInputDevice();
-  const PaDeviceInfo* info = Pa_GetDeviceInfo(def);
-  if (info) { pick.index = def; pick.name = info->name; }
-  return pick;
+  return devs;
 }
 #endif
 
@@ -242,15 +306,20 @@ enum class AppState { Title, Library, Tuner, FreePlay, Settings, Play };
 struct App {
   RenderState rs;
   Chart chart;
+  SettingsState settings;
   AppState state = AppState::Title;
   int menuIndex = 0; // index into title menu
   bool running = true;
   bool playing = true; // used in Play state
   std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
   GameplayStats stats; // hit/miss tracking
+  std::array<float, kFrameHistory> frameTimes{};
+  int frameTimeIdx = 0;
+  bool frameTimesFull = false;
+  bool showFrameGraph = false;
 };
 
-bool initSDL(RenderState& rs) {
+bool initSDL(RenderState& rs, const SettingsState& settings) {
   SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
   if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_EVENTS|SDL_INIT_TIMER) != 0) {
     std::cerr << "SDL_Init: " << SDL_GetError() << "\n"; return false;
@@ -259,7 +328,9 @@ bool initSDL(RenderState& rs) {
                                SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                rs.w, rs.h, SDL_WINDOW_SHOWN);
   if (!rs.window) { std::cerr << "SDL_CreateWindow failed\n"; return false; }
-  rs.r = SDL_CreateRenderer(rs.window, -1, SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
+  Uint32 flags = SDL_RENDERER_ACCELERATED;
+  if (settings.vsync) flags |= SDL_RENDERER_PRESENTVSYNC;
+  rs.r = SDL_CreateRenderer(rs.window, -1, flags);
   if (!rs.r) { std::cerr << "SDL_CreateRenderer failed\n"; return false; }
   // Create render targets
   rs.laneTex = SDL_CreateTexture(rs.r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, rs.w, rs.h);
@@ -300,8 +371,42 @@ void updateGameplay(App& app, int64_t now_ms) {
   app.stats.accuracy = total ? (float)app.stats.hits * 100.f / total : 100.f;
 }
 
+void renderFrameGraph(App& app) {
+  SDL_Renderer* r = app.rs.r;
+  const int w = kFrameHistory;
+  const int h = 60;
+  const int x0 = 10;
+  const int y0 = 10;
+
+  SDL_SetRenderDrawColor(r, 0, 0, 0, 160);
+  SDL_Rect bg{ x0-1, y0-1, w+2, h+2 };
+  SDL_RenderFillRect(r, &bg);
+
+  SDL_SetRenderDrawColor(r, 100, 100, 100, 255);
+  SDL_RenderDrawLine(r, x0, y0 + h/2, x0 + w, y0 + h/2);
+
+  SDL_SetRenderDrawColor(r, 0, 255, 0, 255);
+  float scale = h / (16.7f * 2.f);
+  int count = app.frameTimesFull ? kFrameHistory : app.frameTimeIdx;
+  int start = app.frameTimesFull ? app.frameTimeIdx : 0;
+  for (int i = 1; i < count; ++i) {
+    int idx0 = (start + i - 1) % kFrameHistory;
+    int idx1 = (start + i) % kFrameHistory;
+    float t0 = std::min(app.frameTimes[idx0], 33.4f);
+    float t1 = std::min(app.frameTimes[idx1], 33.4f);
+    int x1 = x0 + i - 1;
+    int x2 = x0 + i;
+    int y1 = y0 + h - int(t0 * scale);
+    int y2 = y0 + h - int(t1 * scale);
+    SDL_RenderDrawLine(r, x1, y1, x2, y2);
+  }
+}
+
 // Render the play state (chart + tuner overlay)
-void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms, const GameplayStats& stats) {
+void drawChart(RenderState& rs, const Chart* chart, const SettingsState& settings, int64_t now_ms) {
+
+  RenderState& rs = app.rs;
+
   // First pass: render chart to offscreen texture
   SDL_SetRenderTarget(rs.r, rs.laneTex);
   SDL_SetRenderDrawColor(rs.r, 12,12,16,255);
@@ -310,13 +415,9 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms, const Gamepl
   // Colored lanes (low E bottom → purple, high E top → red)
   int laneH = rs.h / 8;
   int topOffset = laneH; // top margin
-  static const SDL_Color kStrColors[6] = {
-    {128,0,255,255}, {0,0,255,255}, {0,255,0,255},
-    {255,255,0,255}, {255,128,0,255}, {255,0,0,255}
-  };
   for (int s = 0; s < 6; ++s) {
     int y = rs.h - topOffset - s*laneH;
-    SDL_Color c = kStrColors[s];
+    SDL_Color c = settings.stringColors[s];
     SDL_SetRenderDrawColor(rs.r, c.r/4, c.g/4, c.b/4, 255);
     SDL_Rect lane{ 0, y - laneH/2, rs.w, laneH-2 };
     SDL_RenderFillRect(rs.r, &lane);
@@ -355,7 +456,7 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms, const Gamepl
       int headW = std::max(12, (int)(12 * scale));
       int sustainW = w - headW;
 
-      SDL_Color c = kStrColors[sIdx];
+      SDL_Color c = settings.stringColors[sIdx];
       SDL_SetRenderDrawColor(rs.r, c.r, c.g, c.b, alpha);
       SDL_Rect head{ (int)x - headW/2, y - h/2, headW, h };
       SDL_RenderFillRect(rs.r, &head);
@@ -375,27 +476,91 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms, const Gamepl
     }
   }
 
-  // Bloom processing: downsample and blur
-  SDL_SetRenderTarget(rs.r, rs.bloomTex);
-  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
-  SDL_RenderClear(rs.r);
-  SDL_RenderCopy(rs.r, rs.laneTex, nullptr, nullptr);
-  SDL_SetRenderTarget(rs.r, rs.blurTex);
-  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
-  SDL_RenderClear(rs.r);
-  SDL_SetTextureBlendMode(rs.bloomTex, SDL_BLENDMODE_ADD);
-  int bw = rs.w/2, bh = rs.h/2;
-  const int offsets[5][2] = {{0,0},{-2,0},{2,0},{0,-2},{0,2}};
-  for (const auto& off : offsets) {
-    SDL_Rect dst{off[0], off[1], bw, bh};
-    SDL_RenderCopy(rs.r, rs.bloomTex, nullptr, &dst);
-  }
+  // Bloom: extract bright areas to downsampled texture
+  auto extractBright = [&](Uint8 threshold){
+    void* srcPixels; int srcPitch;
+    void* dstPixels; int dstPitch;
+    SDL_LockTexture(rs.laneTex, nullptr, &srcPixels, &srcPitch);
+    SDL_LockTexture(rs.bloomTex, nullptr, &dstPixels, &dstPitch);
+    SDL_PixelFormat* fmt = SDL_AllocFormat(SDL_PIXELFORMAT_RGBA8888);
+    int sw = rs.w, sh = rs.h;
+    int dw = sw/2, dh = sh/2;
+    Uint32* src = static_cast<Uint32*>(srcPixels);
+    Uint32* dst = static_cast<Uint32*>(dstPixels);
+    int sStride = srcPitch/4;
+    int dStride = dstPitch/4;
+    for (int y=0;y<dh;++y){
+      for (int x=0;x<dw;++x){
+        int r=0,g=0,b=0;
+        for(int oy=0;oy<2;++oy) for(int ox=0;ox<2;++ox){
+          Uint8 pr,pg,pb,pa;
+          SDL_GetRGBA(src[(y*2+oy)*sStride + (x*2+ox)], fmt, &pr,&pg,&pb,&pa);
+          r+=pr; g+=pg; b+=pb;
+        }
+        r/=4; g/=4; b/=4;
+        Uint8 bright = (Uint8)((r+g+b)/3);
+        if (bright < threshold) r=g=b=0;
+        dst[y*dStride+x] = SDL_MapRGBA(fmt,(Uint8)r,(Uint8)g,(Uint8)b,255);
+      }
+    }
+    SDL_UnlockTexture(rs.laneTex);
+    SDL_UnlockTexture(rs.bloomTex);
+    SDL_FreeFormat(fmt);
+  };
+
+  auto blur = [&](){
+    int w = rs.w/2, h = rs.h/2;
+    const int k[5] = {1,4,6,4,1};
+    SDL_PixelFormat* fmt = SDL_AllocFormat(SDL_PIXELFORMAT_RGBA8888);
+    // horizontal
+    void* srcPix; int srcPitch; void* dstPix; int dstPitch;
+    SDL_LockTexture(rs.bloomTex, nullptr, &srcPix, &srcPitch);
+    SDL_LockTexture(rs.blurTex,  nullptr, &dstPix, &dstPitch);
+    Uint32* src = static_cast<Uint32*>(srcPix); int sStride = srcPitch/4;
+    Uint32* dst = static_cast<Uint32*>(dstPix); int dStride = dstPitch/4;
+    for(int y=0;y<h;++y){
+      for(int x=0;x<w;++x){
+        int sr=0,sg=0,sb=0;
+        for(int i=-2;i<=2;++i){
+          int sx = std::clamp(x+i,0,w-1);
+          Uint8 r,g,b,a; SDL_GetRGBA(src[y*sStride+sx], fmt,&r,&g,&b,&a);
+          int wgt = k[i+2]; sr+=r*wgt; sg+=g*wgt; sb+=b*wgt;
+        }
+        dst[y*dStride+x] = SDL_MapRGBA(fmt, (Uint8)(sr/16), (Uint8)(sg/16), (Uint8)(sb/16), 255);
+      }
+    }
+    SDL_UnlockTexture(rs.bloomTex);
+    SDL_UnlockTexture(rs.blurTex);
+    // vertical back into bloomTex
+    SDL_LockTexture(rs.blurTex,  nullptr, &srcPix, &srcPitch);
+    SDL_LockTexture(rs.bloomTex, nullptr, &dstPix, &dstPitch);
+    src = static_cast<Uint32*>(srcPix); sStride = srcPitch/4;
+    dst = static_cast<Uint32*>(dstPix); dStride = dstPitch/4;
+    for(int y=0;y<h;++y){
+      for(int x=0;x<w;++x){
+        int sr=0,sg=0,sb=0;
+        for(int i=-2;i<=2;++i){
+          int sy = std::clamp(y+i,0,h-1);
+          Uint8 r,g,b,a; SDL_GetRGBA(src[sy*sStride+x], fmt,&r,&g,&b,&a);
+          int wgt = k[i+2]; sr+=r*wgt; sg+=g*wgt; sb+=b*wgt;
+        }
+        dst[y*dStride+x] = SDL_MapRGBA(fmt, (Uint8)(sr/16), (Uint8)(sg/16), (Uint8)(sb/16), 255);
+      }
+    }
+    SDL_UnlockTexture(rs.blurTex);
+    SDL_UnlockTexture(rs.bloomTex);
+    SDL_FreeFormat(fmt);
+  };
+
+  extractBright(200);
+  blur();
+
   SDL_SetRenderTarget(rs.r, nullptr);
   SDL_SetRenderDrawColor(rs.r,0,0,0,255);
   SDL_RenderClear(rs.r);
   SDL_RenderCopy(rs.r, rs.laneTex, nullptr, nullptr);
-  SDL_SetTextureBlendMode(rs.blurTex, SDL_BLENDMODE_ADD);
-  SDL_RenderCopy(rs.r, rs.blurTex, nullptr, nullptr);
+  SDL_SetTextureBlendMode(rs.bloomTex, SDL_BLENDMODE_ADD);
+  SDL_RenderCopy(rs.r, rs.bloomTex, nullptr, nullptr);
 
   // Detected note overlay
   float hz = g_detectedHz.load(std::memory_order_relaxed);
@@ -447,6 +612,8 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms, const Gamepl
     drawText(rs.r, buf, x, baseY, fretScale, SDL_Color{120,120,140,255});
   }
 
+  if (app.showFrameGraph) renderFrameGraph(app);
+
   SDL_RenderPresent(rs.r);
 }
 
@@ -478,6 +645,7 @@ void renderTitle(App& app) {
     int textY = y + (itemH - 8*scale) / 2;
     drawTextCentered(app.rs, kMenu[i].first, textY, scale, SDL_Color{20,20,20,255});
   }
+  if (app.showFrameGraph) renderFrameGraph(app);
   SDL_RenderPresent(app.rs.r);
 }
 
@@ -517,6 +685,7 @@ void updateTitle(App& app, const SDL_Event& e) {
 void renderStub(App& app) {
   SDL_SetRenderDrawColor(app.rs.r, 20,20,25,255);
   SDL_RenderClear(app.rs.r);
+  if (app.showFrameGraph) renderFrameGraph(app);
   SDL_RenderPresent(app.rs.r);
 }
 
@@ -571,6 +740,7 @@ void renderTuner(App& app) {
       drawTextCentered(app.rs, buf, cy+80, 4, SDL_Color{200,200,220,255});
     }
   }
+  if (app.showFrameGraph) renderFrameGraph(app);
   SDL_RenderPresent(app.rs.r);
 }
 
@@ -592,31 +762,60 @@ void updatePlay(App& app, const SDL_Event& e){
 // --------- Main ---------
 #ifndef ROCKTRAINER_NO_MAIN
 int main(int argc, char** argv) {
-  std::string chartPath = (argc > 1) ? argv[1] : "charts/example.json";
+  fs::path exeDir;
+  try {
+    exeDir = fs::canonical(fs::path(argv[0])).parent_path();
+  } catch (const fs::filesystem_error&) {
+    exeDir = fs::current_path();
+  }
+  fs::path dataRoot = exeDir;
+  if (!fs::exists(dataRoot / "charts")) {
+    dataRoot = exeDir.parent_path();
+  }
+
+  fs::path chartPath = (argc > 1) ? fs::path(argv[1]) : fs::path("charts") / "example.json";
+  if (!chartPath.is_absolute()) {
+    chartPath = dataRoot / chartPath;
+  }
+  if (!fs::exists(chartPath)) {
+    std::cerr << "Chart file not found: " << chartPath << "\n";
+    return 1;
+  }
+
+  fs::path assetsDir = dataRoot / "assets";
+  if (!fs::exists(assetsDir)) {
+    std::cerr << "Assets directory not found: " << assetsDir << "\n";
+    return 1;
+  }
+
   App app{};
+  loadConfig("config.json", app.settings);
+  g_latencyOffsetMs.store(app.settings.latencyOffset);
   app.chart = loadChart(chartPath).value_or(Chart{});
 #ifdef RT_ENABLE_AUDIO
   AudioState st{};
   PaStream* stream = nullptr;
 
-  // Init PortAudio
   Pa_Initialize();
-  auto pick = pickInputDevice();
-  if (pick.index < 0) {
+  app.settings.audioDevices = listAudioDevices();
+  int dev = app.settings.audioDeviceIndex;
+  if (dev < 0) dev = Pa_GetDefaultInputDevice();
+  const PaDeviceInfo* info = Pa_GetDeviceInfo(dev);
+  if (!info) {
     std::cerr << "No input device found.\n";
     return 1;
   }
-  std::cout << "Using input: " << pick.name << "\n";
+  app.settings.audioDeviceIndex = dev;
+  std::cout << "Using input: " << info->name << "\n";
 
   PaStreamParameters in{};
-  in.device = pick.index;
-  const PaDeviceInfo* info = Pa_GetDeviceInfo(in.device);
+  in.device = dev;
   in.channelCount = 1;
   in.sampleFormat = paFloat32;
   in.suggestedLatency = info ? info->defaultLowInputLatency : 0.0;
   in.hostApiSpecificStreamInfo = nullptr;
 
-  st.hop = kHopSize;
+  st.hop = app.settings.bufferSize;
   st.inputFrame = new_fvec(st.hop);
   st.pitch = new_aubio_pitch("yinfast", kWinSize, st.hop, (unsigned)kSampleRate);
   aubio_pitch_set_unit(st.pitch, "Hz");
@@ -625,17 +824,33 @@ int main(int argc, char** argv) {
   PaError err = Pa_OpenStream(&stream, &in, nullptr, kSampleRate, st.hop, paNoFlag, audioCb, &st);
   if (err != paNoError) { std::cerr << "Pa_OpenStream: " << Pa_GetErrorText(err) << "\n"; return 1; }
   Pa_StartStream(stream);
+#else
+  app.settings.audioDevices.clear();
 #endif
 
+  app.rs.w = app.settings.width;
+  app.rs.h = app.settings.height;
   // Init SDL
-  if (!initSDL(app.rs)) { std::cerr << "SDL init failed\n"; return 1; }
+  if (!initSDL(app.rs, app.settings)) { std::cerr << "SDL init failed\n"; return 1; }
+
+  const double freq = (double)SDL_GetPerformanceFrequency();
+  Uint64 lastCounter = SDL_GetPerformanceCounter();
 
   // Main loop
   while (app.running) {
+    Uint64 nowCounter = SDL_GetPerformanceCounter();
+    float dt_ms = float((nowCounter - lastCounter) * 1000.0 / freq);
+    lastCounter = nowCounter;
+    app.frameTimes[app.frameTimeIdx] = dt_ms;
+    app.frameTimeIdx = (app.frameTimeIdx + 1) % kFrameHistory;
+    if (app.frameTimeIdx == 0) app.frameTimesFull = true;
+
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
       if (e.type == SDL_QUIT) app.running = false;
-      else {
+      else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F3) {
+        app.showFrameGraph = !app.showFrameGraph;
+      } else {
         switch (app.state) {
           case AppState::Title:   updateTitle(app, e); break;
           case AppState::Library: updateLibrary(app, e); break;
@@ -681,6 +896,9 @@ int main(int argc, char** argv) {
   if (app.rs.r) SDL_DestroyRenderer(app.rs.r);
   if (app.rs.window) SDL_DestroyWindow(app.rs.window);
   SDL_Quit();
+
+  app.settings.latencyOffset = g_latencyOffsetMs.load();
+  saveConfig("config.json", app.settings);
 
   return 0;
 }

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+git config core.hooksPath .githooks
+
 # Ensure Homebrew bin is on PATH (Apple Silicon)
 export PATH="/opt/homebrew/bin:$PATH"
 
