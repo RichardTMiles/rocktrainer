@@ -100,6 +100,10 @@ inline std::optional<DetectedNote> analyzeFrequency(double hz) {
 }
 
 static const char* kStringNames[6] = {"E2","A2","D3","G3","B3","E4"};
+static const SDL_Color kStrColors[6] = {
+  {128,0,255,255}, {0,0,255,255}, {0,255,0,255},
+  {255,255,0,255}, {255,128,0,255}, {255,0,0,255}
+};
 
 inline void drawChar(SDL_Renderer* r, char c, int x, int y, int scale, SDL_Color col) {
   unsigned uc = static_cast<unsigned char>(c);
@@ -238,6 +242,8 @@ struct App {
   bool running = true;
   bool playing = true; // used in Play state
   std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  int lastBeat = -1;
+  int64_t lastTickMs = 0;
 };
 
 bool initSDL(RenderState& rs) {
@@ -263,7 +269,8 @@ bool initSDL(RenderState& rs) {
 }
 
 // Render the play state (chart + tuner overlay)
-void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
+void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms,
+               bool showOverlay = true, bool present = true) {
   // First pass: render chart to offscreen texture
   SDL_SetRenderTarget(rs.r, rs.laneTex);
   SDL_SetRenderDrawColor(rs.r, 12,12,16,255);
@@ -272,10 +279,6 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
   // Colored lanes (low E bottom → purple, high E top → red)
   int laneH = rs.h / 8;
   int topOffset = laneH; // top margin
-  static const SDL_Color kStrColors[6] = {
-    {128,0,255,255}, {0,0,255,255}, {0,255,0,255},
-    {255,255,0,255}, {255,128,0,255}, {255,0,0,255}
-  };
   for (int s = 0; s < 6; ++s) {
     int y = rs.h - topOffset - s*laneH;
     SDL_Color c = kStrColors[s];
@@ -359,34 +362,36 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
   SDL_SetTextureBlendMode(rs.blurTex, SDL_BLENDMODE_ADD);
   SDL_RenderCopy(rs.r, rs.blurTex, nullptr, nullptr);
 
-  // Detected note overlay
-  float hz = g_detectedHz.load(std::memory_order_relaxed);
-  if (hz > 0.0f) {
-    auto dn = analyzeFrequency(hz);
-    if (dn) {
-      auto [name, octave] = midiToName(dn->midi);
-      char buf[128];
-      snprintf(buf, sizeof(buf), "Hz: %.1f  %s%d  %+0.1f cents  %s",
-               hz, name.c_str(), octave, dn->cents,
-               (dn->fret >= 0 && dn->stringIdx >= 0) ? ("S" + std::to_string(6-dn->stringIdx) + " F" + std::to_string(dn->fret)).c_str()
-                                                     : "—");
-      // crude text: draw as rectangles for now (placeholder)
-      // You can replace with SDL_ttf later. For now, draw a small bar proportional to pitch.
-      int bar = std::clamp((int)((hz/1000.0)*rs.w), 0, rs.w);
-      SDL_SetRenderDrawColor(rs.r, 200,200,220,255);
-      SDL_Rect rect{20, 20, bar, 8};
-      SDL_RenderFillRect(rs.r, &rect);
-      // draw a simple vertical cent indicator
-      int cx = rs.w/2 + (int)(dn->cents * 2); // scale cents
-      SDL_SetRenderDrawColor(rs.r, 255,120,120,255);
-      SDL_RenderDrawLine(rs.r, cx, 40, cx, 80);
-      // center line
-      SDL_SetRenderDrawColor(rs.r, 150,150,150,255);
-      SDL_RenderDrawLine(rs.r, rs.w/2, 40, rs.w/2, 80);
+  if (showOverlay) {
+    // Detected note overlay
+    float hz = g_detectedHz.load(std::memory_order_relaxed);
+    if (hz > 0.0f) {
+      auto dn = analyzeFrequency(hz);
+      if (dn) {
+        auto [name, octave] = midiToName(dn->midi);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Hz: %.1f  %s%d  %+0.1f cents  %s",
+                 hz, name.c_str(), octave, dn->cents,
+                 (dn->fret >= 0 && dn->stringIdx >= 0) ? ("S" + std::to_string(6-dn->stringIdx) + " F" + std::to_string(dn->fret)).c_str()
+                                                       : "—");
+        // crude text: draw as rectangles for now (placeholder)
+        // You can replace with SDL_ttf later. For now, draw a small bar proportional to pitch.
+        int bar = std::clamp((int)((hz/1000.0)*rs.w), 0, rs.w);
+        SDL_SetRenderDrawColor(rs.r, 200,200,220,255);
+        SDL_Rect rect{20, 20, bar, 8};
+        SDL_RenderFillRect(rs.r, &rect);
+        // draw a simple vertical cent indicator
+        int cx = rs.w/2 + (int)(dn->cents * 2); // scale cents
+        SDL_SetRenderDrawColor(rs.r, 255,120,120,255);
+        SDL_RenderDrawLine(rs.r, cx, 40, cx, 80);
+        // center line
+        SDL_SetRenderDrawColor(rs.r, 150,150,150,255);
+        SDL_RenderDrawLine(rs.r, rs.w/2, 40, rs.w/2, 80);
+      }
     }
   }
 
-  SDL_RenderPresent(rs.r);
+  if (present) SDL_RenderPresent(rs.r);
 }
 
 // --------- Render helpers for other states ---------
@@ -431,6 +436,8 @@ void updateTitle(App& app, const SDL_Event& e) {
     } else if (e.key.keysym.sym == SDLK_RETURN) {
       app.state = kMenu[app.menuIndex].second;
       app.t0 = std::chrono::steady_clock::now();
+      app.lastBeat = -1;
+      app.lastTickMs = 0;
     } else if (e.key.keysym.sym == SDLK_ESCAPE) {
       app.running = false;
     }
@@ -467,7 +474,48 @@ void updateReturnToTitle(App& app, const SDL_Event& e) {
 void renderLibrary(App& app){ renderStub(app); }
 void updateLibrary(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
 
-void renderFreePlay(App& app){ renderStub(app); }
+void renderFreePlay(App& app){
+  static Chart freeChart{};
+  freeChart.bpm = 120.0; // fixed BPM for metronome
+
+  int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - app.t0).count();
+
+  double beatMs = 60000.0 / freeChart.bpm;
+  int beat = (int)(now_ms / beatMs);
+  if (beat != app.lastBeat) {
+    app.lastBeat = beat;
+    app.lastTickMs = now_ms;
+  }
+
+  drawChart(app.rs, &freeChart, now_ms, false, false);
+
+  // metronome flash
+  if (now_ms - app.lastTickMs < 100) {
+    SDL_SetRenderDrawColor(app.rs.r, 255,255,255,80);
+    SDL_Rect flash{0,0,app.rs.w,app.rs.h};
+    SDL_RenderFillRect(app.rs.r, &flash);
+  }
+
+  // live detected note
+  float hz = g_detectedHz.load(std::memory_order_relaxed);
+  if (hz > 0.0f) {
+    auto dn = analyzeFrequency(hz);
+    if (dn && dn->stringIdx >= 0 && dn->fret >= 0) {
+      int laneH = app.rs.h / 8;
+      int topOffset = laneH;
+      int sIdx = dn->stringIdx;
+      int y = app.rs.h - topOffset - sIdx*laneH;
+      SDL_Color c = kStrColors[sIdx];
+      SDL_SetRenderDrawColor(app.rs.r, c.r, c.g, c.b, 255);
+      int size = laneH/2;
+      SDL_Rect rect{ app.rs.w/2 - size/2, y - size/2, size, size };
+      SDL_RenderFillRect(app.rs.r, &rect);
+    }
+  }
+
+  SDL_RenderPresent(app.rs.r);
+}
 void updateFreePlay(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
 
 void renderSettings(App& app){ renderStub(app); }
