@@ -49,6 +49,7 @@ endif()
 add_executable(rocktrainer
         src/main.cpp
 )
+set_target_properties(rocktrainer PROPERTIES OUTPUT_NAME NeonStrings)
 
 # Includes
 target_include_directories(rocktrainer PRIVATE
