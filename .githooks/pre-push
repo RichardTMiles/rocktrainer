@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running pre-push build check..."
+
+if command -v act >/dev/null 2>&1; then
+  echo "Found 'act'; running GitHub Actions workflow."
+  act -j build
+else
+  echo "'act' not found; running local cmake build."
+  cmake -S . -B build
+  cmake --build build --parallel
+fi
