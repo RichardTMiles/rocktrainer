@@ -216,6 +216,9 @@ struct RenderState {
   SDL_Window* window = nullptr;
   SDL_Renderer* r = nullptr;
   int w = 1280, h = 720;
+  SDL_Texture* laneTex = nullptr;  // full-res offscreen
+  SDL_Texture* bloomTex = nullptr; // downsampled bright areas
+  SDL_Texture* blurTex = nullptr;  // blurred result
 };
 
 inline void drawTextCentered(RenderState& rs, std::string_view text, int y, int scale, SDL_Color col) {
@@ -238,6 +241,7 @@ struct App {
 };
 
 bool initSDL(RenderState& rs) {
+  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
   if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_EVENTS|SDL_INIT_TIMER) != 0) {
     std::cerr << "SDL_Init: " << SDL_GetError() << "\n"; return false;
   }
@@ -247,12 +251,21 @@ bool initSDL(RenderState& rs) {
   if (!rs.window) { std::cerr << "SDL_CreateWindow failed\n"; return false; }
   rs.r = SDL_CreateRenderer(rs.window, -1, SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
   if (!rs.r) { std::cerr << "SDL_CreateRenderer failed\n"; return false; }
+  // Create render targets
+  rs.laneTex = SDL_CreateTexture(rs.r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, rs.w, rs.h);
+  int bw = rs.w/2, bh = rs.h/2;
+  rs.bloomTex = SDL_CreateTexture(rs.r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, bw, bh);
+  rs.blurTex  = SDL_CreateTexture(rs.r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, bw, bh);
+  if (!rs.laneTex || !rs.bloomTex || !rs.blurTex) {
+    std::cerr << "Texture creation failed\n"; return false;
+  }
   return true;
 }
 
 // Render the play state (chart + tuner overlay)
 void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
-  // Clear bg
+  // First pass: render chart to offscreen texture
+  SDL_SetRenderTarget(rs.r, rs.laneTex);
   SDL_SetRenderDrawColor(rs.r, 12,12,16,255);
   SDL_RenderClear(rs.r);
 
@@ -324,6 +337,28 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
     }
   }
 
+  // Bloom processing: downsample and blur
+  SDL_SetRenderTarget(rs.r, rs.bloomTex);
+  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
+  SDL_RenderClear(rs.r);
+  SDL_RenderCopy(rs.r, rs.laneTex, nullptr, nullptr);
+  SDL_SetRenderTarget(rs.r, rs.blurTex);
+  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
+  SDL_RenderClear(rs.r);
+  SDL_SetTextureBlendMode(rs.bloomTex, SDL_BLENDMODE_ADD);
+  int bw = rs.w/2, bh = rs.h/2;
+  const int offsets[5][2] = {{0,0},{-2,0},{2,0},{0,-2},{0,2}};
+  for (const auto& off : offsets) {
+    SDL_Rect dst{off[0], off[1], bw, bh};
+    SDL_RenderCopy(rs.r, rs.bloomTex, nullptr, &dst);
+  }
+  SDL_SetRenderTarget(rs.r, nullptr);
+  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
+  SDL_RenderClear(rs.r);
+  SDL_RenderCopy(rs.r, rs.laneTex, nullptr, nullptr);
+  SDL_SetTextureBlendMode(rs.blurTex, SDL_BLENDMODE_ADD);
+  SDL_RenderCopy(rs.r, rs.blurTex, nullptr, nullptr);
+
   // Detected note overlay
   float hz = g_detectedHz.load(std::memory_order_relaxed);
   if (hz > 0.0f) {
@@ -383,16 +418,35 @@ void renderTitle(App& app) {
 }
 
 void updateTitle(App& app, const SDL_Event& e) {
-  if (e.type != SDL_KEYDOWN) return;
-  if (e.key.keysym.sym == SDLK_UP) {
-    app.menuIndex = (app.menuIndex + (int)kMenu.size() - 1) % (int)kMenu.size();
-  } else if (e.key.keysym.sym == SDLK_DOWN) {
-    app.menuIndex = (app.menuIndex + 1) % (int)kMenu.size();
-  } else if (e.key.keysym.sym == SDLK_RETURN) {
-    app.state = kMenu[app.menuIndex].second;
-    app.t0 = std::chrono::steady_clock::now();
-  } else if (e.key.keysym.sym == SDLK_ESCAPE) {
-    app.running = false;
+  int itemH = 60;
+  int startY = app.rs.h/2 - (int)kMenu.size()*itemH/2;
+  if (e.type == SDL_KEYDOWN) {
+    if (e.key.keysym.sym == SDLK_UP) {
+      app.menuIndex = (app.menuIndex + (int)kMenu.size() - 1) % (int)kMenu.size();
+    } else if (e.key.keysym.sym == SDLK_DOWN) {
+      app.menuIndex = (app.menuIndex + 1) % (int)kMenu.size();
+    } else if (e.key.keysym.sym == SDLK_RETURN) {
+      app.state = kMenu[app.menuIndex].second;
+      app.t0 = std::chrono::steady_clock::now();
+    } else if (e.key.keysym.sym == SDLK_ESCAPE) {
+      app.running = false;
+    }
+  } else if (e.type == SDL_MOUSEMOTION) {
+    int mx = e.motion.x;
+    int my = e.motion.y;
+    if (mx >= app.rs.w/3 && mx < 2*app.rs.w/3 &&
+        my >= startY && my < startY + (int)kMenu.size()*itemH) {
+      app.menuIndex = (my - startY) / itemH;
+    }
+  } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+    int mx = e.button.x;
+    int my = e.button.y;
+    if (mx >= app.rs.w/3 && mx < 2*app.rs.w/3 &&
+        my >= startY && my < startY + (int)kMenu.size()*itemH) {
+      app.menuIndex = (my - startY) / itemH;
+      app.state = kMenu[app.menuIndex].second;
+      app.t0 = std::chrono::steady_clock::now();
+    }
   }
 }
 
@@ -471,6 +525,7 @@ void updatePlay(App& app, const SDL_Event& e){
 }
 
 // --------- Main ---------
+#ifndef ROCKTRAINER_NO_MAIN
 int main(int argc, char** argv) {
   std::string chartPath = (argc > 1) ? argv[1] : "charts/example.json";
   App app{};
@@ -555,9 +610,13 @@ int main(int argc, char** argv) {
   Pa_Terminate();
 #endif
 
+  if (app.rs.blurTex) SDL_DestroyTexture(app.rs.blurTex);
+  if (app.rs.bloomTex) SDL_DestroyTexture(app.rs.bloomTex);
+  if (app.rs.laneTex) SDL_DestroyTexture(app.rs.laneTex);
   if (app.rs.r) SDL_DestroyRenderer(app.rs.r);
   if (app.rs.window) SDL_DestroyWindow(app.rs.window);
   SDL_Quit();
 
   return 0;
 }
+#endif // ROCKTRAINER_NO_MAIN
