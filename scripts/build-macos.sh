@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-git config core.hooksPath .githooks
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
-# Ensure Homebrew bin is on PATH (Apple Silicon)
 export PATH="/opt/homebrew/bin:$PATH"
+if ! command -v brew >/dev/null 2>&1; then
+  echo "Homebrew not found" >&2
+  exit 1
+fi
 
-# Install deps if missing
-brew list --versions portaudio  >/dev/null 2>&1 || brew install portaudio
-brew list --versions aubio      >/dev/null 2>&1 || brew install aubio
-brew list --versions sdl2       >/dev/null 2>&1 || brew install sdl2
-brew list --versions nlohmann-json >/dev/null 2>&1 || brew install nlohmann-json
-brew list --versions cmake >/dev/null 2>&1 || brew install cmake
+for pkg in portaudio aubio sdl2 nlohmann-json cmake; do
+  brew list --versions "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+done
 
-mkdir -p build
-cd build
-cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
-cmake --build . -j
+cmake -S . -B build
+cmake --build build
+

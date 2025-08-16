@@ -50,6 +50,7 @@ add_executable(rocktrainer
         src/main.cpp
         src/chart_mss.cpp
 )
+set_target_properties(rocktrainer PROPERTIES OUTPUT_NAME NeonStrings)
 
 # Includes
 target_include_directories(rocktrainer PRIVATE
