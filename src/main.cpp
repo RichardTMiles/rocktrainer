@@ -216,6 +216,9 @@ struct RenderState {
   SDL_Window* window = nullptr;
   SDL_Renderer* r = nullptr;
   int w = 1280, h = 720;
+  SDL_Texture* laneTex = nullptr;  // full-res offscreen
+  SDL_Texture* bloomTex = nullptr; // downsampled bright areas
+  SDL_Texture* blurTex = nullptr;  // blurred result
 };
 
 inline void drawTextCentered(RenderState& rs, std::string_view text, int y, int scale, SDL_Color col) {
@@ -238,6 +241,7 @@ struct App {
 };
 
 bool initSDL(RenderState& rs) {
+  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
   if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_EVENTS|SDL_INIT_TIMER) != 0) {
     std::cerr << "SDL_Init: " << SDL_GetError() << "\n"; return false;
   }
@@ -247,12 +251,21 @@ bool initSDL(RenderState& rs) {
   if (!rs.window) { std::cerr << "SDL_CreateWindow failed\n"; return false; }
   rs.r = SDL_CreateRenderer(rs.window, -1, SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
   if (!rs.r) { std::cerr << "SDL_CreateRenderer failed\n"; return false; }
+  // Create render targets
+  rs.laneTex = SDL_CreateTexture(rs.r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, rs.w, rs.h);
+  int bw = rs.w/2, bh = rs.h/2;
+  rs.bloomTex = SDL_CreateTexture(rs.r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, bw, bh);
+  rs.blurTex  = SDL_CreateTexture(rs.r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, bw, bh);
+  if (!rs.laneTex || !rs.bloomTex || !rs.blurTex) {
+    std::cerr << "Texture creation failed\n"; return false;
+  }
   return true;
 }
 
 // Render the play state (chart + tuner overlay)
 void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
-  // Clear bg
+  // First pass: render chart to offscreen texture
+  SDL_SetRenderTarget(rs.r, rs.laneTex);
   SDL_SetRenderDrawColor(rs.r, 12,12,16,255);
   SDL_RenderClear(rs.r);
 
@@ -323,6 +336,28 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
       }
     }
   }
+
+  // Bloom processing: downsample and blur
+  SDL_SetRenderTarget(rs.r, rs.bloomTex);
+  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
+  SDL_RenderClear(rs.r);
+  SDL_RenderCopy(rs.r, rs.laneTex, nullptr, nullptr);
+  SDL_SetRenderTarget(rs.r, rs.blurTex);
+  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
+  SDL_RenderClear(rs.r);
+  SDL_SetTextureBlendMode(rs.bloomTex, SDL_BLENDMODE_ADD);
+  int bw = rs.w/2, bh = rs.h/2;
+  const int offsets[5][2] = {{0,0},{-2,0},{2,0},{0,-2},{0,2}};
+  for (const auto& off : offsets) {
+    SDL_Rect dst{off[0], off[1], bw, bh};
+    SDL_RenderCopy(rs.r, rs.bloomTex, nullptr, &dst);
+  }
+  SDL_SetRenderTarget(rs.r, nullptr);
+  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
+  SDL_RenderClear(rs.r);
+  SDL_RenderCopy(rs.r, rs.laneTex, nullptr, nullptr);
+  SDL_SetTextureBlendMode(rs.blurTex, SDL_BLENDMODE_ADD);
+  SDL_RenderCopy(rs.r, rs.blurTex, nullptr, nullptr);
 
   // Detected note overlay
   float hz = g_detectedHz.load(std::memory_order_relaxed);
@@ -555,6 +590,9 @@ int main(int argc, char** argv) {
   Pa_Terminate();
 #endif
 
+  if (app.rs.blurTex) SDL_DestroyTexture(app.rs.blurTex);
+  if (app.rs.bloomTex) SDL_DestroyTexture(app.rs.bloomTex);
+  if (app.rs.laneTex) SDL_DestroyTexture(app.rs.laneTex);
   if (app.rs.r) SDL_DestroyRenderer(app.rs.r);
   if (app.rs.window) SDL_DestroyWindow(app.rs.window);
   SDL_Quit();
