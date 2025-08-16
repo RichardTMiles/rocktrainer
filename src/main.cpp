@@ -14,8 +14,10 @@
 #include <iostream>
 #include <fstream>
 
+#ifdef RT_ENABLE_AUDIO
 #include <portaudio.h>
 #include <aubio/aubio.h>
+#endif
 #include <SDL.h>
 
 // nlohmann json (header-only). Install via package manager.
@@ -25,8 +27,8 @@ using json = nlohmann::json;
 
 // --------- Config ---------
 static constexpr double kSampleRate = 48000.0;
-static constexpr uint_t kHopSize = 512;   // buffer size per callback
-static constexpr uint_t kWinSize = 2048;  // analysis window
+static constexpr unsigned kHopSize = 512;   // buffer size per callback
+static constexpr unsigned kWinSize = 2048;  // analysis window
 static constexpr float  kSilenceDb = -50.0f;
 static constexpr int    kMaxFrets = 24;
 
@@ -36,6 +38,8 @@ struct NoteEvent {
   int      str;   // 1..6 (1 = high E)
   int      fret;  // 0..24
   int64_t len_ms; // duration
+  int      slideTo = -1;               // target fret for slide, -1 if none
+  std::vector<std::string> techs;      // technique tags
 };
 struct Chart {
   std::vector<NoteEvent> notes;
@@ -111,6 +115,10 @@ std::optional<Chart> loadChart(const std::string& path) {
       e.str    = n.value("str", 1);
       e.fret   = n.value("fret", 0);
       e.len_ms = n.value("len", 240);
+      if (n.contains("slide")) e.slideTo = n["slide"].get<int>();
+      if (n.contains("techs") && n["techs"].is_array()) {
+        for (auto& t : n["techs"]) e.techs.push_back(t.get<std::string>());
+      }
       c.notes.push_back(e);
     }
     std::sort(c.notes.begin(), c.notes.end(),
@@ -119,11 +127,12 @@ std::optional<Chart> loadChart(const std::string& path) {
   return c;
 }
 
+#ifdef RT_ENABLE_AUDIO
 // --------- PortAudio + aubio ---------
 struct AudioState {
   fvec_t* inputFrame = nullptr;
   aubio_pitch_t* pitch = nullptr;
-  uint_t hop = kHopSize;
+  unsigned hop = kHopSize;
 };
 
 static int audioCb(const void* input, void*, unsigned long frameCount,
@@ -172,6 +181,7 @@ DevicePick pickInputDevice() {
   if (info) { pick.index = def; pick.name = info->name; }
   return pick;
 }
+#endif
 
 // --------- SDL2 Render ---------
 struct RenderState {
@@ -207,36 +217,76 @@ bool initSDL(RenderState& rs) {
 }
 
 // Render the play state (chart + tuner overlay)
-void renderPlayScreen(RenderState& rs, const Chart* chart, int64_t now_ms) {
+void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
   // Clear bg
   SDL_SetRenderDrawColor(rs.r, 12,12,16,255);
   SDL_RenderClear(rs.r);
 
-  // Draw 6 string lanes horizontal bands (low E at bottom)
+  // Colored lanes (low E bottom → purple, high E top → red)
   int laneH = rs.h / 8;
   int topOffset = laneH; // top margin
+  static const SDL_Color kStrColors[6] = {
+    {128,0,255,255}, {0,0,255,255}, {0,255,0,255},
+    {255,255,0,255}, {255,128,0,255}, {255,0,0,255}
+  };
   for (int s = 0; s < 6; ++s) {
     int y = rs.h - topOffset - s*laneH;
-    SDL_SetRenderDrawColor(rs.r, 30,30,40,255);
+    SDL_Color c = kStrColors[s];
+    SDL_SetRenderDrawColor(rs.r, c.r/4, c.g/4, c.b/4, 255);
     SDL_Rect lane{ 0, y - laneH/2, rs.w, laneH-2 };
     SDL_RenderFillRect(rs.r, &lane);
   }
 
+  // Hit line at center
+  SDL_SetRenderDrawColor(rs.r, 255,255,255,120);
+  SDL_RenderDrawLine(rs.r, rs.w/2, topOffset/2, rs.w/2, rs.h-topOffset/2);
+
   if (chart) {
-    // time → x position (simple scroll): notes move left to right
-    // Visible window ~ 4 seconds
     const double windowMs = 4000.0;
+    double beatMs = 60000.0 / chart->bpm;
+    double measureMs = beatMs * 4.0;
+    int64_t startBeat = (int64_t)std::floor((now_ms - windowMs) / beatMs) * (int64_t)beatMs;
+    int64_t endTime = now_ms + (int64_t)windowMs;
+    for (double t = startBeat; t <= endTime; t += beatMs) {
+      double dtb = t - now_ms;
+      double x = (dtb / windowMs) * rs.w * 0.9 + rs.w*0.5;
+      if (x < 0 || x > rs.w) continue;
+      bool isMeasure = std::fmod(t, measureMs) < 1.0;
+      SDL_SetRenderDrawColor(rs.r, 255,255,255, isMeasure ? 100 : 40);
+      SDL_RenderDrawLine(rs.r, (int)x, topOffset/2, (int)x, rs.h-topOffset/2);
+    }
+
     for (const auto& n : chart->notes) {
       double dt = (double)(n.t_ms - now_ms);
-      if (dt < -2000 || dt > windowMs) continue; // cull
+      if (dt < -2000 || dt > windowMs) continue;
       double x = (dt / windowMs) * rs.w * 0.9 + rs.w*0.5;
-      int sIdx = std::clamp(6 - n.str, 0, 5); // chart str: 1=high E → map to top; draw bottom→top
+      int sIdx = std::clamp(6 - n.str, 0, 5);
       int y = rs.h - topOffset - sIdx*laneH;
-      int h = laneH/2;
-      int w = std::max(12, (int)( (n.len_ms/windowMs) * rs.w * 0.9 ));
-      SDL_SetRenderDrawColor(rs.r, 80,180,250,255);
-      SDL_Rect rect{ (int)x, y - h/2, w, h };
-      SDL_RenderFillRect(rs.r, &rect);
+      double depth = std::clamp(1.0 - std::abs(dt)/windowMs, 0.0, 1.0);
+      double scale = 0.5 + 0.5*depth;
+      Uint8 alpha = (Uint8)(255 * depth);
+      int h = (int)(laneH/2 * scale);
+      int w = std::max(12, (int)((n.len_ms/windowMs) * rs.w * 0.9));
+      int headW = std::max(12, (int)(12 * scale));
+      int sustainW = w - headW;
+
+      SDL_Color c = kStrColors[sIdx];
+      SDL_SetRenderDrawColor(rs.r, c.r, c.g, c.b, alpha);
+      SDL_Rect head{ (int)x - headW/2, y - h/2, headW, h };
+      SDL_RenderFillRect(rs.r, &head);
+      if (sustainW > 0) {
+        SDL_Rect sus{ head.x + headW, y - h/4, sustainW, h/2 };
+        SDL_RenderFillRect(rs.r, &sus);
+        if (n.slideTo >= 0 && n.slideTo != n.fret) {
+          double dy = (n.slideTo - n.fret) * (laneH/24.0);
+          SDL_RenderDrawLine(rs.r, head.x + headW, y, head.x + headW + sustainW, (int)(y + dy));
+        }
+      }
+      if (!n.techs.empty()) {
+        SDL_SetRenderDrawColor(rs.r, 255,255,255, alpha);
+        SDL_Rect tag{ head.x - 6, head.y - 10, 12, 8 };
+        SDL_RenderFillRect(rs.r, &tag);
+      }
     }
   }
 
@@ -356,7 +406,7 @@ void renderTuner(App& app) {
 void updateTuner(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
 
 void renderPlay(App& app, int64_t now_ms){
-  renderPlayScreen(app.rs, app.chart.notes.empty()?nullptr:&app.chart, now_ms);
+  drawChart(app.rs, app.chart.notes.empty()?nullptr:&app.chart, now_ms);
 }
 
 void updatePlay(App& app, const SDL_Event& e){
@@ -372,6 +422,9 @@ int main(int argc, char** argv) {
   std::string chartPath = (argc > 1) ? argv[1] : "charts/example.json";
   App app{};
   app.chart = loadChart(chartPath).value_or(Chart{});
+#ifdef RT_ENABLE_AUDIO
+  AudioState st{};
+  PaStream* stream = nullptr;
 
   // Init PortAudio
   Pa_Initialize();
@@ -390,17 +443,16 @@ int main(int argc, char** argv) {
   in.suggestedLatency = info ? info->defaultLowInputLatency : 0.0;
   in.hostApiSpecificStreamInfo = nullptr;
 
-  AudioState st{};
   st.hop = kHopSize;
   st.inputFrame = new_fvec(st.hop);
-  st.pitch = new_aubio_pitch("yinfast", kWinSize, st.hop, (uint_t)kSampleRate);
+  st.pitch = new_aubio_pitch("yinfast", kWinSize, st.hop, (unsigned)kSampleRate);
   aubio_pitch_set_unit(st.pitch, "Hz");
   aubio_pitch_set_silence(st.pitch, kSilenceDb);
 
-  PaStream* stream = nullptr;
   PaError err = Pa_OpenStream(&stream, &in, nullptr, kSampleRate, st.hop, paNoFlag, audioCb, &st);
   if (err != paNoError) { std::cerr << "Pa_OpenStream: " << Pa_GetErrorText(err) << "\n"; return 1; }
   Pa_StartStream(stream);
+#endif
 
   // Init SDL
   if (!initSDL(app.rs)) { std::cerr << "SDL init failed\n"; return 1; }
@@ -443,10 +495,12 @@ int main(int argc, char** argv) {
   }
 
   // Cleanup
+#ifdef RT_ENABLE_AUDIO
   if (stream) { Pa_StopStream(stream); Pa_CloseStream(stream); }
   del_aubio_pitch(st.pitch);
   del_fvec(st.inputFrame);
   Pa_Terminate();
+#endif
 
   if (app.rs.r) SDL_DestroyRenderer(app.rs.r);
   if (app.rs.window) SDL_DestroyWindow(app.rs.window);
