@@ -23,7 +23,8 @@ jobs:
             brew update
             brew install portaudio aubio sdl2 nlohmann-json
           else
-            choco install -y portaudio aubio sdl2 || echo "Install dependencies manually"
+            choco install -y pkgconfiglite portaudio aubio sdl2 nlohmann-json || \
+              echo "Install dependencies manually"
           fi
       - name: Configure
         run: cmake -S . -B build
