@@ -337,27 +337,91 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
     }
   }
 
-  // Bloom processing: downsample and blur
-  SDL_SetRenderTarget(rs.r, rs.bloomTex);
-  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
-  SDL_RenderClear(rs.r);
-  SDL_RenderCopy(rs.r, rs.laneTex, nullptr, nullptr);
-  SDL_SetRenderTarget(rs.r, rs.blurTex);
-  SDL_SetRenderDrawColor(rs.r,0,0,0,255);
-  SDL_RenderClear(rs.r);
-  SDL_SetTextureBlendMode(rs.bloomTex, SDL_BLENDMODE_ADD);
-  int bw = rs.w/2, bh = rs.h/2;
-  const int offsets[5][2] = {{0,0},{-2,0},{2,0},{0,-2},{0,2}};
-  for (const auto& off : offsets) {
-    SDL_Rect dst{off[0], off[1], bw, bh};
-    SDL_RenderCopy(rs.r, rs.bloomTex, nullptr, &dst);
-  }
+  // Bloom: extract bright areas to downsampled texture
+  auto extractBright = [&](Uint8 threshold){
+    void* srcPixels; int srcPitch;
+    void* dstPixels; int dstPitch;
+    SDL_LockTexture(rs.laneTex, nullptr, &srcPixels, &srcPitch);
+    SDL_LockTexture(rs.bloomTex, nullptr, &dstPixels, &dstPitch);
+    SDL_PixelFormat* fmt = SDL_AllocFormat(SDL_PIXELFORMAT_RGBA8888);
+    int sw = rs.w, sh = rs.h;
+    int dw = sw/2, dh = sh/2;
+    Uint32* src = static_cast<Uint32*>(srcPixels);
+    Uint32* dst = static_cast<Uint32*>(dstPixels);
+    int sStride = srcPitch/4;
+    int dStride = dstPitch/4;
+    for (int y=0;y<dh;++y){
+      for (int x=0;x<dw;++x){
+        int r=0,g=0,b=0;
+        for(int oy=0;oy<2;++oy) for(int ox=0;ox<2;++ox){
+          Uint8 pr,pg,pb,pa;
+          SDL_GetRGBA(src[(y*2+oy)*sStride + (x*2+ox)], fmt, &pr,&pg,&pb,&pa);
+          r+=pr; g+=pg; b+=pb;
+        }
+        r/=4; g/=4; b/=4;
+        Uint8 bright = (Uint8)((r+g+b)/3);
+        if (bright < threshold) r=g=b=0;
+        dst[y*dStride+x] = SDL_MapRGBA(fmt,(Uint8)r,(Uint8)g,(Uint8)b,255);
+      }
+    }
+    SDL_UnlockTexture(rs.laneTex);
+    SDL_UnlockTexture(rs.bloomTex);
+    SDL_FreeFormat(fmt);
+  };
+
+  auto blur = [&](){
+    int w = rs.w/2, h = rs.h/2;
+    const int k[5] = {1,4,6,4,1};
+    SDL_PixelFormat* fmt = SDL_AllocFormat(SDL_PIXELFORMAT_RGBA8888);
+    // horizontal
+    void* srcPix; int srcPitch; void* dstPix; int dstPitch;
+    SDL_LockTexture(rs.bloomTex, nullptr, &srcPix, &srcPitch);
+    SDL_LockTexture(rs.blurTex,  nullptr, &dstPix, &dstPitch);
+    Uint32* src = static_cast<Uint32*>(srcPix); int sStride = srcPitch/4;
+    Uint32* dst = static_cast<Uint32*>(dstPix); int dStride = dstPitch/4;
+    for(int y=0;y<h;++y){
+      for(int x=0;x<w;++x){
+        int sr=0,sg=0,sb=0;
+        for(int i=-2;i<=2;++i){
+          int sx = std::clamp(x+i,0,w-1);
+          Uint8 r,g,b,a; SDL_GetRGBA(src[y*sStride+sx], fmt,&r,&g,&b,&a);
+          int wgt = k[i+2]; sr+=r*wgt; sg+=g*wgt; sb+=b*wgt;
+        }
+        dst[y*dStride+x] = SDL_MapRGBA(fmt, (Uint8)(sr/16), (Uint8)(sg/16), (Uint8)(sb/16), 255);
+      }
+    }
+    SDL_UnlockTexture(rs.bloomTex);
+    SDL_UnlockTexture(rs.blurTex);
+    // vertical back into bloomTex
+    SDL_LockTexture(rs.blurTex,  nullptr, &srcPix, &srcPitch);
+    SDL_LockTexture(rs.bloomTex, nullptr, &dstPix, &dstPitch);
+    src = static_cast<Uint32*>(srcPix); sStride = srcPitch/4;
+    dst = static_cast<Uint32*>(dstPix); dStride = dstPitch/4;
+    for(int y=0;y<h;++y){
+      for(int x=0;x<w;++x){
+        int sr=0,sg=0,sb=0;
+        for(int i=-2;i<=2;++i){
+          int sy = std::clamp(y+i,0,h-1);
+          Uint8 r,g,b,a; SDL_GetRGBA(src[sy*sStride+x], fmt,&r,&g,&b,&a);
+          int wgt = k[i+2]; sr+=r*wgt; sg+=g*wgt; sb+=b*wgt;
+        }
+        dst[y*dStride+x] = SDL_MapRGBA(fmt, (Uint8)(sr/16), (Uint8)(sg/16), (Uint8)(sb/16), 255);
+      }
+    }
+    SDL_UnlockTexture(rs.blurTex);
+    SDL_UnlockTexture(rs.bloomTex);
+    SDL_FreeFormat(fmt);
+  };
+
+  extractBright(200);
+  blur();
+
   SDL_SetRenderTarget(rs.r, nullptr);
   SDL_SetRenderDrawColor(rs.r,0,0,0,255);
   SDL_RenderClear(rs.r);
   SDL_RenderCopy(rs.r, rs.laneTex, nullptr, nullptr);
-  SDL_SetTextureBlendMode(rs.blurTex, SDL_BLENDMODE_ADD);
-  SDL_RenderCopy(rs.r, rs.blurTex, nullptr, nullptr);
+  SDL_SetTextureBlendMode(rs.bloomTex, SDL_BLENDMODE_ADD);
+  SDL_RenderCopy(rs.r, rs.bloomTex, nullptr, nullptr);
 
   // Detected note overlay
   float hz = g_detectedHz.load(std::memory_order_relaxed);
