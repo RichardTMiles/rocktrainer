@@ -402,9 +402,11 @@ void renderFrameGraph(App& app) {
 }
 
 // Render the play state (chart + tuner overlay)
-void drawChart(RenderState& rs, const Chart* chart, const SettingsState& settings, int64_t now_ms) {
-
+// Uses data from the app to draw the current chart at the given time.
+void drawChart(App& app, const Chart* chart, int64_t now_ms) {
   RenderState& rs = app.rs;
+  const SettingsState& settings = app.settings;
+  const GameplayStats& stats = app.stats;
 
   // First pass: render chart to offscreen texture
   SDL_SetRenderTarget(rs.r, rs.laneTex);
@@ -747,7 +749,7 @@ void updateTuner(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
 
 void renderPlay(App& app, int64_t now_ms){
   updateGameplay(app, now_ms);
-  drawChart(app.rs, app.chart.notes.empty()?nullptr:&app.chart, now_ms, app.stats);
+  drawChart(app, app.chart.notes.empty()?nullptr:&app.chart, now_ms);
 }
 
 void updatePlay(App& app, const SDL_Event& e){
