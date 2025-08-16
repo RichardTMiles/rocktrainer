@@ -291,6 +291,15 @@ inline void drawTextCentered(RenderState& rs, std::string_view text, int y, int 
   drawText(rs.r, text, x, y, scale, col);
 }
 
+// Simple gameplay statistics tracked during play state
+struct GameplayStats {
+  int hits = 0;
+  int misses = 0;
+  int combo = 0;
+  float accuracy = 100.f;
+  std::size_t nextNote = 0; // index of next note to judge
+};
+
 // --------- App State Machine ---------
 enum class AppState { Title, Library, Tuner, FreePlay, Settings, Play };
 
@@ -303,6 +312,7 @@ struct App {
   bool running = true;
   bool playing = true; // used in Play state
   std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  GameplayStats stats; // hit/miss tracking
   std::array<float, kFrameHistory> frameTimes{};
   int frameTimeIdx = 0;
   bool frameTimesFull = false;
@@ -331,6 +341,34 @@ bool initSDL(RenderState& rs, const SettingsState& settings) {
     std::cerr << "Texture creation failed\n"; return false;
   }
   return true;
+}
+
+// Update gameplay stats based on detected frequency and current time
+void updateGameplay(App& app, int64_t now_ms) {
+  const int hitWindow = 100; // milliseconds
+  float hz = g_detectedHz.load(std::memory_order_relaxed);
+  auto det = analyzeFrequency(hz);
+  while (app.stats.nextNote < app.chart.notes.size()) {
+    const auto& n = app.chart.notes[app.stats.nextNote];
+    if (now_ms < n.t_ms - hitWindow) break; // upcoming note
+    bool hit = false;
+    if (det && std::abs(now_ms - n.t_ms) <= hitWindow) {
+      if (det->stringIdx >= 0 && det->fret >= 0) {
+        int detStr = 6 - det->stringIdx; // convert back to 1..6
+        if (detStr == n.str && det->fret == n.fret) hit = true;
+      }
+    }
+    if (hit) {
+      app.stats.hits++;
+      app.stats.combo++;
+    } else {
+      app.stats.misses++;
+      app.stats.combo = 0;
+    }
+    app.stats.nextNote++;
+  }
+  int total = app.stats.hits + app.stats.misses;
+  app.stats.accuracy = total ? (float)app.stats.hits * 100.f / total : 100.f;
 }
 
 void renderFrameGraph(App& app) {
@@ -368,6 +406,7 @@ void renderFrameGraph(App& app) {
 void drawChart(RenderState& rs, const Chart* chart, const SettingsState& settings, int64_t now_ms) {
 
   RenderState& rs = app.rs;
+
   // First pass: render chart to offscreen texture
   SDL_SetRenderTarget(rs.r, rs.laneTex);
   SDL_SetRenderDrawColor(rs.r, 12,12,16,255);
@@ -550,7 +589,31 @@ void drawChart(RenderState& rs, const Chart* chart, const SettingsState& setting
     }
   }
 
+  // Draw song title at top-left
+  if (chart) {
+    drawText(rs.r, chart->title, 10, 10, 2, SDL_Color{200,200,220,255});
+  }
+
+  // Draw combo and accuracy at top-right
+  char statsBuf[64];
+  snprintf(statsBuf, sizeof(statsBuf), "Combo %d  Acc %.1f%%", stats.combo, stats.accuracy);
+  int scale = 2;
+  int statsW = (int)std::strlen(statsBuf) * 8 * scale;
+  drawText(rs.r, statsBuf, rs.w - statsW - 10, 10, scale, SDL_Color{200,200,220,255});
+
+  // Fret number hints along bottom
+  int fretScale = 1;
+  int baseY = rs.h - 12 * fretScale - 4;
+  int spacing = rs.w / (kMaxFrets + 1);
+  for (int i = 0; i <= kMaxFrets; ++i) {
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%d", i);
+    int x = i * spacing + 5;
+    drawText(rs.r, buf, x, baseY, fretScale, SDL_Color{120,120,140,255});
+  }
+
   if (app.showFrameGraph) renderFrameGraph(app);
+
   SDL_RenderPresent(rs.r);
 }
 
@@ -684,7 +747,8 @@ void renderTuner(App& app) {
 void updateTuner(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
 
 void renderPlay(App& app, int64_t now_ms){
-  drawChart(app.rs, app.chart.notes.empty()?nullptr:&app.chart, app.settings, now_ms);
+  updateGameplay(app, now_ms);
+  drawChart(app.rs, app.chart.notes.empty()?nullptr:&app.chart, now_ms, app.stats);
 }
 
 void updatePlay(App& app, const SDL_Event& e){
