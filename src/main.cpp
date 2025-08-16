@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <array>
 #include <utility>
 #include <optional>
 #include <chrono>
@@ -33,6 +34,7 @@ static constexpr unsigned kHopSize = 512;   // buffer size per callback
 static constexpr unsigned kWinSize = 2048;  // analysis window
 static constexpr float  kSilenceDb = -50.0f;
 static constexpr int    kMaxFrets = 24;
+static constexpr int    kFrameHistory = 120;
 
 // --------- Globals (simple starter) ---------
 struct NoteEvent {
@@ -238,6 +240,10 @@ struct App {
   bool running = true;
   bool playing = true; // used in Play state
   std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  std::array<float, kFrameHistory> frameTimes{};
+  int frameTimeIdx = 0;
+  bool frameTimesFull = false;
+  bool showFrameGraph = false;
 };
 
 bool initSDL(RenderState& rs) {
@@ -262,8 +268,40 @@ bool initSDL(RenderState& rs) {
   return true;
 }
 
+void renderFrameGraph(App& app) {
+  SDL_Renderer* r = app.rs.r;
+  const int w = kFrameHistory;
+  const int h = 60;
+  const int x0 = 10;
+  const int y0 = 10;
+
+  SDL_SetRenderDrawColor(r, 0, 0, 0, 160);
+  SDL_Rect bg{ x0-1, y0-1, w+2, h+2 };
+  SDL_RenderFillRect(r, &bg);
+
+  SDL_SetRenderDrawColor(r, 100, 100, 100, 255);
+  SDL_RenderDrawLine(r, x0, y0 + h/2, x0 + w, y0 + h/2);
+
+  SDL_SetRenderDrawColor(r, 0, 255, 0, 255);
+  float scale = h / (16.7f * 2.f);
+  int count = app.frameTimesFull ? kFrameHistory : app.frameTimeIdx;
+  int start = app.frameTimesFull ? app.frameTimeIdx : 0;
+  for (int i = 1; i < count; ++i) {
+    int idx0 = (start + i - 1) % kFrameHistory;
+    int idx1 = (start + i) % kFrameHistory;
+    float t0 = std::min(app.frameTimes[idx0], 33.4f);
+    float t1 = std::min(app.frameTimes[idx1], 33.4f);
+    int x1 = x0 + i - 1;
+    int x2 = x0 + i;
+    int y1 = y0 + h - int(t0 * scale);
+    int y2 = y0 + h - int(t1 * scale);
+    SDL_RenderDrawLine(r, x1, y1, x2, y2);
+  }
+}
+
 // Render the play state (chart + tuner overlay)
-void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
+void drawChart(App& app, const Chart* chart, int64_t now_ms) {
+  RenderState& rs = app.rs;
   // First pass: render chart to offscreen texture
   SDL_SetRenderTarget(rs.r, rs.laneTex);
   SDL_SetRenderDrawColor(rs.r, 12,12,16,255);
@@ -386,6 +424,7 @@ void drawChart(RenderState& rs, const Chart* chart, int64_t now_ms) {
     }
   }
 
+  if (app.showFrameGraph) renderFrameGraph(app);
   SDL_RenderPresent(rs.r);
 }
 
@@ -417,6 +456,7 @@ void renderTitle(App& app) {
     int textY = y + (itemH - 8*scale) / 2;
     drawTextCentered(app.rs, kMenu[i].first, textY, scale, SDL_Color{20,20,20,255});
   }
+  if (app.showFrameGraph) renderFrameGraph(app);
   SDL_RenderPresent(app.rs.r);
 }
 
@@ -456,6 +496,7 @@ void updateTitle(App& app, const SDL_Event& e) {
 void renderStub(App& app) {
   SDL_SetRenderDrawColor(app.rs.r, 20,20,25,255);
   SDL_RenderClear(app.rs.r);
+  if (app.showFrameGraph) renderFrameGraph(app);
   SDL_RenderPresent(app.rs.r);
 }
 
@@ -510,13 +551,14 @@ void renderTuner(App& app) {
       drawTextCentered(app.rs, buf, cy+80, 4, SDL_Color{200,200,220,255});
     }
   }
+  if (app.showFrameGraph) renderFrameGraph(app);
   SDL_RenderPresent(app.rs.r);
 }
 
 void updateTuner(App& app, const SDL_Event& e){ updateReturnToTitle(app,e); }
 
 void renderPlay(App& app, int64_t now_ms){
-  drawChart(app.rs, app.chart.notes.empty()?nullptr:&app.chart, now_ms);
+  drawChart(app, app.chart.notes.empty()?nullptr:&app.chart, now_ms);
 }
 
 void updatePlay(App& app, const SDL_Event& e){
@@ -568,12 +610,24 @@ int main(int argc, char** argv) {
   // Init SDL
   if (!initSDL(app.rs)) { std::cerr << "SDL init failed\n"; return 1; }
 
+  const double freq = (double)SDL_GetPerformanceFrequency();
+  Uint64 lastCounter = SDL_GetPerformanceCounter();
+
   // Main loop
   while (app.running) {
+    Uint64 nowCounter = SDL_GetPerformanceCounter();
+    float dt_ms = float((nowCounter - lastCounter) * 1000.0 / freq);
+    lastCounter = nowCounter;
+    app.frameTimes[app.frameTimeIdx] = dt_ms;
+    app.frameTimeIdx = (app.frameTimeIdx + 1) % kFrameHistory;
+    if (app.frameTimeIdx == 0) app.frameTimesFull = true;
+
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
       if (e.type == SDL_QUIT) app.running = false;
-      else {
+      else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F3) {
+        app.showFrameGraph = !app.showFrameGraph;
+      } else {
         switch (app.state) {
           case AppState::Title:   updateTitle(app, e); break;
           case AppState::Library: updateLibrary(app, e); break;
