@@ -1,6 +1,6 @@
 # AGENTS
 
-All changes must be verified by building and running tests.
+All changes MUST be verified by building and running new tests.
 
 Commands:
 - `cmake -S . -B build`
